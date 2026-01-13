@@ -1,0 +1,20 @@
+[package]
+name = "franime_dl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.49.0", features = ["full"]}
+serde = {version = "1.0.228", features = ["derive"]}
+serde_json = "1.0.149"
+reqwest = { version = "0.13.1", features = ["json", "blocking", "gzip", "deflate", "brotli", "stream"] }
+zstd = "0.13.3"
+egui = "0.33.3"
+futures = "0.3.31"
+indicatif = "0.18.3"
+chromiumoxide = {version = "0.8.0", features = ["tokio-runtime"]}
+uuid = { version = "1.19.0", features = ["v4"] }
+rusqlite = "0.38.0"
+eframe = "0.33.3"
+image = "0.25.9"
+open = "5.3.3"

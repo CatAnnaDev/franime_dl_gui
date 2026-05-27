@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use serde::Serialize;
-use std::fmt::Display;
 
 pub type FullAnimeslist = Vec<Root2>;
 

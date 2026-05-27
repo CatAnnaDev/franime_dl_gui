@@ -3,25 +3,405 @@ use chromiumoxide::cdp::browser_protocol::network::{
     TimeSinceEpoch,
 };
 use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
-use chromiumoxide::{Browser, BrowserConfig, Page};
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+use chromiumoxide::js::EvaluationResult;
+use chromiumoxide::{browser, Browser, BrowserConfig, Page};
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, RwLock};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, OnceCell, RwLock, Semaphore};
+
+const DEFAULT_CHROME_UA: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+pub const FRANIME_CF_CLEARANCE_FALLBACK: &str = "XWyNnG2HZ0mdGGKuERIMy7maoxBx_a8Mgxo.4IesuVk-1779817968-1.2.1.1-dUqG8LY74pbxbbt0SDpbEA.guo1IuBxVJlJNwHECNgeHpoNW4ahwTeF.N2Qp6HIQTnngjXn.xdtm4blz0FCXvoGLKFg0V5XFhOWrx8e3FgOzGyxcShCgw1pR4mopjkp99_LrGtqpz0XIdlC8RgPD69ELxptHL35NriIL.E9xz1eV91c3eJ9cVZgHCsqngJxaaGQj1NZZQwNigm_m3ON3OgjpoLzjdst5IVeTGiIFZ.EQE0TlY5iWhlyDYHKz8tQmND2wRd_NyulTqXfKMQeZ0My2P4uhutyqeirUAbnO_62wZSghqWvbXaPTzgSY81VPc28x_3zraTeS9rEZ1LGyBg";
+
+pub const CF_COOKIE_KEY: &str = "cf_clearance";
+
+pub struct CookieStore {
+    cookies: tokio::sync::RwLock<std::collections::HashMap<String, String>>,
+    user_agent: tokio::sync::RwLock<String>,
+    save_tx: mpsc::UnboundedSender<String>,
+}
+
+impl CookieStore {
+    pub fn new(initial_cf_clearance: String) -> (Arc<Self>, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut cookies = std::collections::HashMap::new();
+        if !initial_cf_clearance.is_empty() {
+            cookies.insert("cf_clearance".to_string(), initial_cf_clearance);
+        }
+        let store = Arc::new(Self {
+            cookies: tokio::sync::RwLock::new(cookies),
+            user_agent: tokio::sync::RwLock::new(DEFAULT_CHROME_UA.to_string()),
+            save_tx: tx,
+        });
+        (store, rx)
+    }
+
+    pub async fn get(&self) -> String {
+        let x= self.cookies
+            .read()
+            .await
+            .get("cf_clearance")
+            .cloned()
+            .unwrap_or_default();
+        println!("cf_clearance: {}", x);
+        x
+    }
+
+    pub async fn set_all(&self, all: Vec<(String, String)>) {
+        let mut map = self.cookies.write().await;
+        let mut new_clearance: Option<String> = None;
+        for (name, value) in all {
+            if name == "cf_clearance" {
+                new_clearance = Some(value.clone());
+            }
+            map.insert(name, value);
+        }
+        drop(map);
+        if let Some(v) = new_clearance {
+            let _ = self.save_tx.send(v);
+        }
+    }
+
+    pub async fn cookie_header(&self) -> String {
+        self.cookies
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    pub async fn user_agent(&self) -> String {
+        self.user_agent.read().await.clone()
+    }
+
+    pub async fn set_user_agent(&self, ua: String) {
+        *self.user_agent.write().await = ua;
+    }
+}
+
+static IFRAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<iframe[^>]+src=["']([^"']+)["']"#).expect("valid iframe regex")
+});
+
+static SIBNET_PLAYER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"player\.src\(\s*\[\s*\{\s*src:\s*["']([^"']+)["']"#)
+        .expect("valid sibnet player regex")
+});
+
+static SIBNET_FALLBACK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"/v/[A-Za-z0-9_\-/.]+\.mp4"#).expect("valid sibnet fallback regex"));
+
+static SENDVID_SRC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"id=["']video_source["'][^>]*src=["']([^"']+)["']"#)
+        .expect("valid sendvid src regex")
+});
+
+static SENDVID_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<source[^>]+src=["']([^"']+\.mp4[^"']*)["']"#)
+        .expect("valid sendvid source regex")
+});
+
+static CHROME_VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Chrome/(\d+)\.").expect("valid chrome version regex"));
+
+fn sec_ch_ua_for(ua: &str) -> String {
+    let v = CHROME_VERSION_RE
+        .captures(ua)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+        .unwrap_or("148");
+    format!(
+        r#""Google Chrome";v="{}", "Chromium";v="{}", "Not_A Brand";v="24""#,
+        v, v
+    )
+}
+
+async fn eval_stealth(page: &Page, script: &str) -> Result<EvaluationResult> {
+    let params = EvaluateParams::builder()
+        .expression(script)
+        .user_gesture(true)
+        .allow_unsafe_eval_blocked_by_csp(true)
+        .return_by_value(true)
+        .build()
+        .map_err(|e| ScraperError::Navigation(format!("EvaluateParams: {}", e)))?;
+    page.evaluate(params)
+        .await
+        .map_err(|e| ScraperError::Navigation(e.to_string()))
+}
+
+fn is_cloudflare_challenge(html: &str) -> bool {
+    html.contains("Just a moment")
+        || html.contains("challenges.cloudflare.com")
+        || html.contains("cf-challenge-running")
+        || html.contains("cf_chl_opt")
+}
+
+fn is_known_video_host(src: &str) -> bool {
+    let s = src.to_lowercase();
+    const HOSTS: &[&str] = &[
+        "sibnet.ru",
+        "sendvid.com",
+        "filemoon",
+        "vidmoly",
+        "mixdrop",
+        "streamtape",
+        "streamta.pe",
+        "doodstream",
+        "dood.",
+        "upstream",
+        "vudeo",
+        "okru",
+        "ok.ru",
+        "mp4upload",
+        "voe.sx",
+        "vk.com",
+        "streamwish",
+        "streamhide",
+        "mytv",
+        "lulu.st",
+        "embedsito",
+    ];
+    HOSTS.iter().any(|h| s.contains(h))
+}
+
+fn classify_provider(iframe_src: &str) -> VideoProvider {
+    if iframe_src.contains("sibnet.ru") {
+        VideoProvider::Sibnet
+    } else if iframe_src.contains("sendvid.com") {
+        VideoProvider::Sendvid
+    } else if iframe_src.contains("filemoon") {
+        VideoProvider::FileMoon
+    } else if iframe_src.contains("vidmoly") {
+        VideoProvider::Vidmoly
+    } else {
+        VideoProvider::Unknown
+    }
+}
+
+static VIDMOLY_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"sources\s*:\s*\[\s*\{\s*file\s*:\s*["']([^"']+)["']"#)
+        .expect("valid vidmoly regex")
+});
+static GENERIC_MP4_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(https?://[^"'\s<>]+\.(?:mp4|m3u8)(?:\?[^"'\s<>]*)?)"#)
+        .expect("valid generic mp4 regex")
+});
+
+#[derive(Debug)]
+enum HttpAttempt {
+    Found(String),
+    Challenge,
+    Miss,
+}
+
+struct HttpExtractor {
+    client: wreq::Client,
+    cookies: Arc<CookieStore>,
+}
+
+impl HttpExtractor {
+    fn new(cookies: Arc<CookieStore>) -> Self {
+        let client = wreq::Client::builder()
+            .emulation(wreq_util::Emulation::Safari26_2)
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("Failed to build wreq HTTP extractor client");
+        Self { client, cookies }
+    }
+
+    async fn try_iframe_src(&self, url: &str) -> HttpAttempt {
+        let cookie_header = self.cookies.cookie_header().await;
+        let ua = self.cookies.user_agent().await;
+        crate::applog::log_event(
+            crate::applog::LogSource::App,
+            crate::applog::LogLevel::Info,
+            format!("HTTP GET {} cookie_len={}", url, cookie_header.len()),
+        );
+        let resp = match self
+            .client
+            .get(url)
+            .header("User-Agent", &ua)
+            .header("Cookie", cookie_header)
+            .header("Referer", "https://franime.fr/")
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+            .header("Accept-Language", "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7")
+            .header("Accept-Encoding", "gzip, deflate, br, zstd")
+            .header("Sec-Ch-Ua", sec_ch_ua_for(&ua))
+            .header("Sec-Ch-Ua-Mobile", "?0")
+            .header("Sec-Ch-Ua-Platform", "\"macOS\"")
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-User", "?1")
+            .header("Upgrade-Insecure-Requests", "1")
+            .header("Priority", "u=0, i")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Warn,
+                    format!("HTTP error: {}", e),
+                );
+                return HttpAttempt::Miss;
+            }
+        };
+
+        let status = resp.status();
+        let cf_ray = resp.headers().get("cf-ray").is_some();
+        crate::applog::log_event(
+            crate::applog::LogSource::App,
+            crate::applog::LogLevel::Info,
+            format!("HTTP status={} cf-ray={}", status, cf_ray),
+        );
+
+        let html = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Warn,
+                    format!("HTTP body error: {}", e),
+                );
+                return HttpAttempt::Miss;
+            }
+        };
+
+        if is_cloudflare_challenge(&html)
+            || (cf_ray && matches!(status.as_u16(), 403 | 429 | 503))
+        {
+            crate::applog::log_event(
+                crate::applog::LogSource::App,
+                crate::applog::LogLevel::Warn,
+                format!("CF challenge detected (status={} len={})", status, html.len()),
+            );
+            return HttpAttempt::Challenge;
+        }
+
+        if !status.is_success() {
+            return HttpAttempt::Miss;
+        }
+
+        match IFRAME_RE
+            .captures_iter(&html)
+            .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .filter(|src| is_known_video_host(src))
+            .last()
+        {
+            Some(s) => HttpAttempt::Found(s),
+            None => HttpAttempt::Miss,
+        }
+    }
+
+    async fn try_sibnet(&self, iframe_src: &str) -> Option<String> {
+        let ua = self.cookies.user_agent().await;
+        let resp = self
+            .client
+            .get(iframe_src)
+            .header("User-Agent", ua)
+            .header("Referer", "https://video.sibnet.ru/")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let html = resp.text().await.ok()?;
+
+        let path = SIBNET_PLAYER_RE
+            .captures(&html)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .or_else(|| {
+                SIBNET_FALLBACK_RE
+                    .find(&html)
+                    .map(|m| m.as_str().to_string())
+            })?;
+
+        Some(if path.starts_with("http") {
+            path
+        } else if path.starts_with("//") {
+            format!("https:{}", path)
+        } else {
+            format!("https://video.sibnet.ru{}", path)
+        })
+    }
+
+    async fn try_vidmoly(&self, iframe_src: &str) -> Option<String> {
+        let ua = self.cookies.user_agent().await;
+        let resp = self
+            .client
+            .get(iframe_src)
+            .header("User-Agent", ua)
+            .header("Referer", "https://franime.fr/")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let html = resp.text().await.ok()?;
+        if let Some(c) = VIDMOLY_SOURCE_RE.captures(&html) {
+            if let Some(m) = c.get(1) {
+                return Some(m.as_str().to_string());
+            }
+        }
+        GENERIC_MP4_RE
+            .find(&html)
+            .map(|m| m.as_str().to_string())
+    }
+
+    async fn try_sendvid(&self, iframe_src: &str) -> Option<String> {
+        let ua = self.cookies.user_agent().await;
+        let resp = self
+            .client
+            .get(iframe_src)
+            .header("User-Agent", ua)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let html = resp.text().await.ok()?;
+
+        let candidate = SENDVID_SRC_RE
+            .captures(&html)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .or_else(|| {
+                SENDVID_SOURCE_RE
+                    .captures(&html)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().to_string())
+            })?;
+
+        if candidate == "undefined" || candidate.is_empty() {
+            return None;
+        }
+        Some(candidate)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ScraperError {
     BrowserLaunch(String),
     Navigation(String),
-    IframeNotFound,
     VideoSourceNotFound,
     Timeout(String),
     UnsupportedProvider(String),
-    DownloadFailed(String),
     IoError(String),
     NetworkError(String),
 }
@@ -31,11 +411,9 @@ impl std::fmt::Display for ScraperError {
         match self {
             Self::BrowserLaunch(msg) => write!(f, "Erreur de lancement du navigateur: {}", msg),
             Self::Navigation(msg) => write!(f, "Erreur de navigation: {}", msg),
-            Self::IframeNotFound => write!(f, "Iframe non trouvée"),
             Self::VideoSourceNotFound => write!(f, "Source vidéo non trouvée"),
             Self::Timeout(msg) => write!(f, "Timeout: {}", msg),
             Self::UnsupportedProvider(url) => write!(f, "Provider non supporté: {}", url),
-            Self::DownloadFailed(msg) => write!(f, "Échec du téléchargement: {}", msg),
             Self::IoError(msg) => write!(f, "Erreur IO: {}", msg),
             Self::NetworkError(msg) => write!(f, "Erreur réseau: {}", msg),
         }
@@ -57,10 +435,12 @@ pub enum VideoProvider {
     Sibnet,
     Sendvid,
     FileMoon,
+    Vidmoly,
     Unknown,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DownloadProgress {
     pub id: String,
     pub downloaded: u64,
@@ -68,9 +448,11 @@ pub struct DownloadProgress {
     pub percentage: f32,
     pub speed_bytes_per_sec: u64,
     pub eta_seconds: u64,
+    pub resolution: Option<String>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum DownloadStatus {
     Queued,
     Extracting,
@@ -86,6 +468,8 @@ pub struct DownloadTask {
     pub url: String,
     pub output_path: PathBuf,
     pub status: DownloadStatus,
+    pub host: Option<String>,
+    pub attempted_lecteurs: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +483,7 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: 1,
+            max_retries: 0,
             initial_delay_ms: 1000,
             max_delay_ms: 10000,
             backoff_multiplier: 2.0,
@@ -108,59 +492,172 @@ impl Default for RetryConfig {
 }
 
 pub struct FranimeScraper {
-    browser: Browser,
+    browser: OnceCell<Browser>,
+    http: HttpExtractor,
+    cookies: Arc<CookieStore>,
+    sidecar: Arc<crate::cf_sidecar::Sidecar>,
+    refresh_lock: tokio::sync::Mutex<()>,
+    pub cf_refreshing: Arc<std::sync::atomic::AtomicBool>,
     retry_config: RetryConfig,
+    headless: bool,
 }
 
 impl FranimeScraper {
-    pub async fn new(headless: bool) -> Result<Self> {
-        Self::new_with_retry(headless, RetryConfig::default()).await
+    pub fn new(headless: bool, cookies: Arc<CookieStore>) -> Self {
+        Self::new_with_retry(headless, RetryConfig::default(), cookies)
     }
 
-    pub async fn new_with_retry(headless: bool, retry_config: RetryConfig) -> Result<Self> {
-        let config = BrowserConfig::builder();
-        let config = if headless {
-            config
-                .build()
-                .map_err(|e| ScraperError::BrowserLaunch(e.to_string()))?
-        } else {
-            config
-                .with_head()
-                .build()
-                .map_err(|e| ScraperError::BrowserLaunch(e.to_string()))?
-        };
-
-        let (browser, mut handler) = Browser::launch(config)
-            .await
-            .map_err(|e| ScraperError::BrowserLaunch(e.to_string()))?;
-
-        tokio::spawn(async move { while handler.next().await.is_some() {} });
-
-        Ok(Self {
-            browser,
+    pub fn new_with_retry(
+        headless: bool,
+        retry_config: RetryConfig,
+        cookies: Arc<CookieStore>,
+    ) -> Self {
+        Self {
+            browser: OnceCell::new(),
+            http: HttpExtractor::new(cookies.clone()),
+            cookies,
+            sidecar: crate::cf_sidecar::Sidecar::new(headless),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            cf_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retry_config,
-        })
+            headless,
+        }
     }
 
-    async fn setup_cloudflare_cookie(&self, _page: &Page) -> Result<()> {
-        let cookie = CookieParam::builder()
-            .expires(TimeSinceEpoch::new(1799665392.0))
-            .secure(true)
-            .http_only(true)
-            .same_site(CookieSameSite::None)
-            .domain(".franime.fr")
-            .path("/")
-            .name("cf_clearance")
-            .value("_8bup68CEChcEz15Q4QY65VzBn5BFopxSTybAdL1lvU-1768283737-1.2.1.1-K1OeiOg7kGPPq5l26LnXuYMQdiUIaBbetyaX8caqPX014WS5rierp_LXFgzWtR1AJoQPLwdmDmnsniIfOreq2Y4LiGCddOacIB7fOBpLj4snKDRlQDBIkYHHBDxUNbK2Vr4ZZxi7hCboXfDUnI7Iv3s5zJf5FXcGL.xzgqX5VALDOSLoeB0XbzUaUrBauvst_Fy6Ho6ReZJhsrqyr6IS6ucLuYZIQ2o4W419ymmHrH0UCqSBOr9LNkjcTC1aU8A7")
-            .partition_key(CookiePartitionKey::new("https://franime.fr", false))
-            .build()
-            .map_err(|e| ScraperError::BrowserLaunch(e.to_string()))?;
+    async fn ensure_sidecar(&self) -> Result<()> {
+        if self.sidecar.is_alive().await {
+            return Ok(());
+        }
+        self.cf_refreshing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ready_result = self.sidecar.ensure_started().await;
+        self.cf_refreshing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let ready = ready_result.map_err(|e| {
+            crate::applog::log_event(
+                crate::applog::LogSource::Sidecar,
+                crate::applog::LogLevel::Error,
+                format!("start failed: {}", e),
+            );
+            ScraperError::Navigation(format!("sidecar nodriver: {}", e))
+        })?;
+        crate::applog::log_event(
+            crate::applog::LogSource::Sidecar,
+            crate::applog::LogLevel::Info,
+            format!(
+                "ready ua={} cookies={}",
+                &ready.user_agent[..30.min(ready.user_agent.len())],
+                ready.all_cookies.len()
+            ),
+        );
+        if !ready.user_agent.is_empty() {
+            self.cookies.set_user_agent(ready.user_agent).await;
+        }
+        let cookies: Vec<(String, String)> = ready.all_cookies.into_iter().collect();
+        self.cookies.set_all(cookies).await;
+        Ok(())
+    }
 
+    pub fn sidecar(&self) -> Arc<crate::cf_sidecar::Sidecar> {
+        self.sidecar.clone()
+    }
+
+    async fn browser(&self) -> Result<&Browser> {
         self.browser
-            .set_cookies(vec![cookie])
-            .await
-            .map_err(|e| ScraperError::BrowserLaunch(e.to_string()))?;
+            .get_or_try_init(|| async {
+                let profile_dir = std::env::temp_dir()
+                    .join(format!("uc_{}", uuid::Uuid::new_v4().simple()));
+                let _ = fs::create_dir_all(&profile_dir);
 
+                let mut builder = BrowserConfig::builder()
+                    .disable_default_args()
+                    .user_data_dir(&profile_dir)
+                    .arg("--remote-allow-origins=*")
+                    .arg("--no-first-run")
+                    .arg("--no-service-autorun")
+                    .arg("--no-default-browser-check")
+                    .arg("--homepage=about:blank")
+                    .arg("--no-pings")
+                    .arg("--password-store=basic")
+                    .arg("--disable-infobars")
+                    .arg("--disable-breakpad")
+                    .arg("--disable-dev-shm-usage")
+                    .arg("--disable-session-crashed-bubble")
+                    .arg("--disable-search-engine-choice-screen")
+                    .arg("--disable-features=IsolateOrigins,site-per-process");
+
+                if !self.headless {
+                    builder = builder.with_head();
+                }
+                let config = builder
+                    .build()
+                    .map_err(ScraperError::BrowserLaunch)?;
+
+                let (browser, mut handler) = Browser::launch(config)
+                    .await
+                    .map_err(|e| ScraperError::BrowserLaunch(e.to_string()))?;
+
+                tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+                if let Ok(ua) = browser.user_agent().await {
+                    self.cookies.set_user_agent(ua).await;
+                }
+
+                let cookie_value = self.cookies.get().await;
+                if !cookie_value.is_empty() {
+                    let cookie = CookieParam::builder()
+                        .expires(TimeSinceEpoch::new(1799665392.0))
+                        .secure(true)
+                        .http_only(true)
+                        .same_site(CookieSameSite::None)
+                        .domain(".franime.fr")
+                        .path("/")
+                        .name("cf_clearance")
+                        .value(cookie_value)
+                        .partition_key(CookiePartitionKey::new("https://franime.fr", false))
+                        .build()
+                        .map_err(|e| ScraperError::BrowserLaunch(e.to_string()))?;
+
+                    browser
+                        .set_cookies(vec![cookie])
+                        .await
+                        .map_err(|e| ScraperError::BrowserLaunch(e.to_string()))?;
+                }
+
+                Ok(browser)
+            })
+            .await
+    }
+
+    pub async fn refresh_cf_cookie(&self) -> Result<()> {
+        let initial = self.cookies.get().await;
+        let _guard = self.refresh_lock.lock().await;
+
+        if self.cookies.get().await != initial {
+            return Ok(());
+        }
+
+        self.cf_refreshing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = self.do_refresh(initial).await;
+        self.cf_refreshing.store(false, std::sync::atomic::Ordering::SeqCst);
+        result
+    }
+
+    async fn do_refresh(&self, _initial: String) -> Result<()> {
+        self.ensure_sidecar().await?;
+        let ready = self.sidecar.refresh_cf().await.map_err(|e| {
+            crate::applog::log_event(
+                crate::applog::LogSource::Sidecar,
+                crate::applog::LogLevel::Error,
+                format!("refresh_cf failed: {}", e),
+            );
+            ScraperError::Navigation(format!("sidecar refresh_cf: {}", e))
+        })?;
+        if !ready.user_agent.is_empty() {
+            self.cookies.set_user_agent(ready.user_agent).await;
+        }
+        let cookies: Vec<(String, String)> = ready.all_cookies.into_iter().collect();
+        self.cookies.set_all(cookies).await;
         Ok(())
     }
 
@@ -170,48 +667,39 @@ impl FranimeScraper {
     }
 
     async fn extract_video_source_impl(&self, url: &str) -> Result<VideoSource> {
-        let page = self
-            .browser
-            .new_page("https://franime.fr")
-            .await
-            .map_err(|e| ScraperError::Navigation(e.to_string()))?;
-
-        self.setup_cloudflare_cookie(&page).await?;
-
-        let page = page
-            .goto(
-                NavigateParams::builder()
-                    .url(url)
-                    .build()
-                    .map_err(|e| ScraperError::Navigation(e.to_string()))?,
-            )
-            .await
-            .map_err(|e| ScraperError::Navigation(e.to_string()))?
-            .wait_for_navigation()
-            .await
-            .map_err(|e| ScraperError::Navigation(e.to_string()))?;
-
-        self.wait_for_iframes(&page, 2).await?;
-
-        let iframe_src = self.extract_iframe_src(&page).await?;
-
-        let provider = if iframe_src.contains("sibnet.ru") {
-            VideoProvider::Sibnet
-        } else if iframe_src.contains("sendvid.com") {
-            VideoProvider::Sendvid
-        } else if iframe_src.contains("filemoon.to") {
-            println!("FileMoon detected");
-            VideoProvider::FileMoon
-        } else {
-            VideoProvider::Unknown
+        let iframe_src = match self.http.try_iframe_src(url).await {
+            HttpAttempt::Found(s) => s,
+            HttpAttempt::Challenge | HttpAttempt::Miss => {
+                self.browser_iframe_src(url).await?
+            }
         };
 
+        let provider = classify_provider(&iframe_src);
+
         let video_url = match provider {
-            VideoProvider::Sibnet => self.extract_sibnet_url(&page, &iframe_src).await?,
-            VideoProvider::Sendvid => self.extract_sendvid_url(&page, &iframe_src).await?,
-            VideoProvider::FileMoon => self.extract_filemoon_url(&page, &iframe_src).await?,
+            VideoProvider::Sibnet => match self.http.try_sibnet(&iframe_src).await {
+                Some(u) => u,
+                None => match self.http.try_vidmoly(&iframe_src).await {
+                    Some(u) => u,
+                    None => self.extract_via_browser_or_ytdlp(&iframe_src).await?,
+                },
+            },
+            VideoProvider::Sendvid => match self.http.try_sendvid(&iframe_src).await {
+                Some(u) => u,
+                None => self.extract_via_browser_or_ytdlp(&iframe_src).await?,
+            },
+            VideoProvider::FileMoon => self.extract_via_browser_or_ytdlp(&iframe_src).await?,
+            VideoProvider::Vidmoly => match self.http.try_vidmoly(&iframe_src).await {
+                Some(u) => u,
+                None => self.extract_via_browser_or_ytdlp(&iframe_src).await?,
+            },
             VideoProvider::Unknown => {
-                return Err(ScraperError::UnsupportedProvider(iframe_src));
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Info,
+                    format!("Host inconnu, fallback sidecar: {}", iframe_src),
+                );
+                self.extract_via_browser_or_ytdlp(&iframe_src).await?
             }
         };
 
@@ -219,6 +707,129 @@ impl FranimeScraper {
             url: video_url,
             provider,
         })
+    }
+
+    async fn browser_iframe_src(&self, url: &str) -> Result<String> {
+        self.ensure_sidecar().await?;
+        self.sidecar.fetch_iframe(url).await.map_err(|e| {
+            crate::applog::log_event(
+                crate::applog::LogSource::Sidecar,
+                crate::applog::LogLevel::Error,
+                format!("fetch_iframe failed: {}", e),
+            );
+            ScraperError::Navigation(format!("sidecar fetch_iframe: {}", e))
+        })
+    }
+
+    async fn extract_via_browser_or_ytdlp(&self, iframe_src: &str) -> Result<String> {
+        match self.sidecar_capture(iframe_src).await {
+            Ok(u) if !u.is_empty() => return Ok(u),
+            Ok(_) => {
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Warn,
+                    "sidecar_capture vide, tentative yt-dlp",
+                );
+            }
+            Err(e) => {
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Warn,
+                    format!("sidecar_capture KO ({}), tentative yt-dlp", e),
+                );
+            }
+        }
+        crate::applog::log_event(
+            crate::applog::LogSource::App,
+            crate::applog::LogLevel::Info,
+            format!("yt-dlp sur {}", iframe_src),
+        );
+        match crate::ytdlp::extract_url(iframe_src, "https://franime.fr/").await {
+            Ok(u) => {
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Info,
+                    format!("yt-dlp OK: {}", &u[..u.len().min(120)]),
+                );
+                Ok(u)
+            }
+            Err(e) => Err(ScraperError::Navigation(format!("yt-dlp: {}", e))),
+        }
+    }
+
+    async fn sidecar_capture(&self, iframe_src: &str) -> Result<String> {
+        self.ensure_sidecar().await?;
+        self.sidecar
+            .capture_video_url(iframe_src)
+            .await
+            .map_err(|e| {
+                crate::applog::log_event(
+                    crate::applog::LogSource::Sidecar,
+                    crate::applog::LogLevel::Error,
+                    format!("capture_video_url failed: {}", e),
+                );
+                ScraperError::Navigation(format!("sidecar capture: {}", e))
+            })
+    }
+
+    async fn wait_for_provider_iframe(&self, page: &Page) -> Result<String> {
+        let timeout = Duration::from_secs(30);
+        let start = tokio::time::Instant::now();
+
+        loop {
+            if start.elapsed() > timeout {
+                return Err(ScraperError::Timeout(
+                    "Attente d'une iframe provider".to_string(),
+                ));
+            }
+
+            let script = r#"
+                (() => {
+                    const frames = Array.from(document.querySelectorAll('iframe'));
+                    const matched = frames
+                        .map(i => i.src || i.getAttribute('src') || '')
+                        .filter(s => s && (
+                            s.includes('sibnet.ru') ||
+                            s.includes('sendvid.com') ||
+                            s.includes('filemoon')
+                        ));
+                    return matched.length > 0 ? matched[matched.length - 1] : '';
+                })()
+            "#;
+
+            if let Ok(result) = eval_stealth(page, script).await {
+                if let Ok(src) = result.into_value::<String>() {
+                    if !src.is_empty() {
+                        return Ok(src);
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    async fn browser_sibnet(&self, iframe_src: &str) -> Result<String> {
+        let page = self.fresh_page().await?;
+        self.extract_sibnet_url(&page, iframe_src).await
+    }
+
+    async fn browser_sendvid(&self, iframe_src: &str) -> Result<String> {
+        let page = self.fresh_page().await?;
+        self.extract_sendvid_url(&page, iframe_src).await
+    }
+
+    async fn browser_filemoon(&self, iframe_src: &str) -> Result<String> {
+        let page = self.fresh_page().await?;
+        self.extract_filemoon_url(&page, iframe_src).await
+    }
+
+    async fn fresh_page(&self) -> Result<Page> {
+        let browser = self.browser().await?;
+        browser
+            .new_page("about:blank")
+            .await
+            .map_err(|e| ScraperError::Navigation(e.to_string()))
     }
 
     async fn retry_operation<F, Fut, T>(&self, mut operation: F) -> Result<T>
@@ -254,44 +865,6 @@ impl FranimeScraper {
         }
     }
 
-    async fn wait_for_iframes(&self, page: &Page, count: usize) -> Result<()> {
-        let timeout = tokio::time::Duration::from_secs(10);
-        let start = tokio::time::Instant::now();
-
-        loop {
-            if start.elapsed() > timeout {
-                return Err(ScraperError::Timeout("Attente des iframes".to_string()));
-            }
-
-            let frames = page
-                .frames()
-                .await
-                .map_err(|e| ScraperError::Navigation(e.to_string()))?;
-            if frames.len() >= count {
-                break;
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-
-        Ok(())
-    }
-
-    async fn extract_iframe_src(&self, page: &Page) -> Result<String> {
-        let iframes = page
-            .find_xpaths("/html/body/iframe")
-            .await
-            .map_err(|e| ScraperError::Navigation(e.to_string()))?;
-
-        let iframe = iframes.last().ok_or(ScraperError::IframeNotFound)?;
-
-        iframe
-            .attribute("src")
-            .await
-            .map_err(|e| ScraperError::Navigation(e.to_string()))?
-            .ok_or(ScraperError::IframeNotFound)
-    }
-
     async fn extract_sibnet_url(&self, page: &Page, iframe_src: &str) -> Result<String> {
         let video_page = page
             .goto(
@@ -315,20 +888,19 @@ impl FranimeScraper {
             .await
             .map_err(|e| ScraperError::Navigation(e.to_string()))?;
 
-        video_page
-            .evaluate(
-                r#"
-                () => {
-                    const v = document.querySelector('video');
-                    if (!v) return "NO_VIDEO";
-                    v.muted = true;
-                    v.play();
-                    return "PLAYING";
-                }
-                "#,
-            )
-            .await
-            .map_err(|e| ScraperError::Navigation(e.to_string()))?;
+        eval_stealth(
+            &video_page,
+            r#"
+            (() => {
+                const v = document.querySelector('video');
+                if (!v) return "NO_VIDEO";
+                v.muted = true;
+                v.play();
+                return "PLAYING";
+            })()
+            "#,
+        )
+        .await?;
 
         let timeout = tokio::time::Duration::from_secs(15);
         let start = tokio::time::Instant::now();
@@ -341,17 +913,16 @@ impl FranimeScraper {
             let res = &ev.response;
 
             if res.mime_type == "video/mp4" && res.url.contains("sibnet.ru") {
-                video_page
-                    .evaluate(
-                        r#"
-                        () => {
-                            const v = document.querySelector('video');
-                            if (v) v.pause();
-                        }
-                        "#,
-                    )
-                    .await
-                    .map_err(|e| ScraperError::Navigation(e.to_string()))?;
+                eval_stealth(
+                    &video_page,
+                    r#"
+                    (() => {
+                        const v = document.querySelector('video');
+                        if (v) v.pause();
+                    })()
+                    "#,
+                )
+                .await?;
 
                 return Ok(res.url.clone());
             }
@@ -374,22 +945,35 @@ impl FranimeScraper {
             .await
             .map_err(|e| ScraperError::Navigation(e.to_string()))?;
 
-        let video_elem = video_page
-            .find_xpath(r#"//*[@id="video_source"]"#)
-            .await
-            .map_err(|e| ScraperError::Navigation(e.to_string()))?;
+        let timeout = Duration::from_secs(15);
+        let start = tokio::time::Instant::now();
+        loop {
+            if start.elapsed() > timeout {
+                return Err(ScraperError::Timeout(
+                    "Attente de la source sendvid".to_string(),
+                ));
+            }
 
-        let src = video_elem
-            .attribute("src")
-            .await
-            .map_err(|e| ScraperError::Navigation(e.to_string()))?
-            .ok_or(ScraperError::VideoSourceNotFound)?;
+            let script = r#"
+                (() => {
+                    const el = document.getElementById('video_source')
+                        || document.querySelector('source[src]');
+                    if (!el) return '';
+                    const s = el.getAttribute('src') || '';
+                    return (s && s !== 'undefined') ? s : '';
+                })()
+            "#;
 
-        if src == "undefined" {
-            return Err(ScraperError::VideoSourceNotFound);
+            if let Ok(result) = eval_stealth(&video_page, script).await {
+                if let Ok(src) = result.into_value::<String>() {
+                    if !src.is_empty() {
+                        return Ok(src);
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
-
-        Ok(src)
     }
 
     async fn extract_filemoon_url(&self, page: &Page, iframe_src: &str) -> Result<String> {
@@ -417,7 +1001,6 @@ impl FranimeScraper {
 
         let timeout = tokio::time::Duration::from_secs(50);
         let start = tokio::time::Instant::now();
-        println!("Attente de l'URL vidéo...");
         while let Some(ev) = net_events.next().await {
             if start.elapsed() > timeout {
                 return Err(ScraperError::Timeout("Attente de l'URL vidéo".to_string()));
@@ -425,9 +1008,7 @@ impl FranimeScraper {
 
             let res = &ev.response;
 
-            println!("URL: {} {}", res.url, res.mime_type);
-
-            if res.mime_type == "" && res.url.contains("filemoon.to") {
+            if res.mime_type.is_empty() && res.url.contains("filemoon.to") {
                 return Ok(res.url.clone());
             }
         }
@@ -436,191 +1017,303 @@ impl FranimeScraper {
     }
 }
 
+pub fn sanitize_path_segment(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        "_".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum DownloadEvent {
+    Updated(DownloadTask),
+    Removed(String),
+}
+
 pub struct DownloadManager {
     scraper: Arc<FranimeScraper>,
     downloader: Arc<VideoDownloader>,
     tasks: Arc<RwLock<Vec<DownloadTask>>>,
-    max_concurrent: usize,
-    update_tx: mpsc::UnboundedSender<DownloadTask>,
+    semaphore: Arc<Semaphore>,
+    update_tx: mpsc::UnboundedSender<DownloadEvent>,
+    cancel_signals:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>>,
 }
 
 impl DownloadManager {
-    pub async fn new(
+    pub fn new(
         headless: bool,
         max_concurrent: usize,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<DownloadTask>)> {
-        let scraper = Arc::new(FranimeScraper::new(headless).await?);
+        tasks: Arc<RwLock<Vec<DownloadTask>>>,
+        cookies: Arc<CookieStore>,
+    ) -> (Self, mpsc::UnboundedReceiver<DownloadEvent>) {
+        let scraper = Arc::new(FranimeScraper::new(headless, cookies));
         let downloader = Arc::new(VideoDownloader::new());
-        let tasks = Arc::new(RwLock::new(Vec::new()));
+        let semaphore = Arc::new(Semaphore::new(max_concurrent.max(1)));
         let (update_tx, update_rx) = mpsc::unbounded_channel();
 
-        Ok((
+        (
             Self {
                 scraper,
                 downloader,
                 tasks,
-                max_concurrent,
+                semaphore,
                 update_tx,
+                cancel_signals: Arc::new(tokio::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
             },
             update_rx,
-        ))
+        )
     }
 
-    pub async fn add_download(
-        &self,
-        url: String,
-        output_path: String,
-        output_name: String,
-    ) -> String {
-        fs::create_dir_all(&output_path).unwrap();
-        let output_path = Path::new(&output_path).join(output_name);
+    pub fn sidecar(&self) -> Arc<crate::cf_sidecar::Sidecar> {
+        self.scraper.sidecar()
+    }
+
+    pub async fn set_task_host(&self, id: &str, host: Option<String>) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
+            t.host = host;
+            let _ = self.update_tx.send(DownloadEvent::Updated(t.clone()));
+        }
+    }
+
+    pub async fn add_attempted_lecteur(&self, id: &str, lecteur: u64) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
+            if !t.attempted_lecteurs.contains(&lecteur) {
+                t.attempted_lecteurs.push(lecteur);
+            }
+            let _ = self.update_tx.send(DownloadEvent::Updated(t.clone()));
+        }
+    }
+
+    async fn cancel_signal_for(&self, id: &str) -> Arc<tokio::sync::Notify> {
+        let mut map = self.cancel_signals.lock().await;
+        map.entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
+    }
+
+    async fn forget_cancel_signal(&self, id: &str) {
+        self.cancel_signals.lock().await.remove(id);
+    }
+
+    pub async fn warmup_sidecar(&self) -> Result<()> {
+        self.scraper.ensure_sidecar().await
+    }
+
+    pub fn cf_refreshing(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.scraper.cf_refreshing.clone()
+    }
+
+    pub async fn add_pending(&self, output_path: PathBuf) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let task = DownloadTask {
             id: id.clone(),
-            url,
+            url: String::new(),
             output_path,
-            status: DownloadStatus::Queued,
+            status: DownloadStatus::Extracting,
+            host: None,
+            attempted_lecteurs: Vec::new(),
         };
-
         self.tasks.write().await.push(task.clone());
-        self.notify_update(task);
-
-        let manager = self.clone_for_task();
-        let id_clone = id.clone();
-        tokio::spawn(async move {
-            manager.process_task(id_clone).await;
-        });
-
+        let _ = self.update_tx.send(DownloadEvent::Updated(task));
         id
     }
 
-    pub async fn cancel_download(&self, id: &str) -> Result<()> {
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
-            task.status = DownloadStatus::Cancelled;
-            self.notify_update(task.clone());
-            Ok(())
-        } else {
-            Err(ScraperError::DownloadFailed(format!(
-                "Tâche non trouvée: {}",
-                id
-            )))
-        }
-    }
-
-    pub async fn get_tasks(&self) -> Vec<DownloadTask> {
-        self.tasks.read().await.clone()
-    }
-
-    pub async fn get_task(&self, id: &str) -> Option<DownloadTask> {
-        self.tasks.read().await.iter().find(|t| t.id == id).cloned()
-    }
-
-    async fn process_task(&self, id: String) {
-        loop {
-            let active_count = self
-                .tasks
-                .read()
-                .await
-                .iter()
-                .filter(|t| {
-                    matches!(
-                        t.status,
-                        DownloadStatus::Extracting | DownloadStatus::Downloading(_)
-                    )
-                })
-                .count();
-
-            if active_count < self.max_concurrent {
-                break;
+    pub async fn extract_and_download(
+        &self,
+        id: String,
+        iframe_url: String,
+    ) -> Result<()> {
+        {
+            let mut tasks = self.tasks.write().await;
+            match tasks.iter_mut().find(|t| t.id == id) {
+                Some(t) => {
+                    t.url = iframe_url.clone();
+                    t.status = DownloadStatus::Extracting;
+                    let _ = self.update_tx.send(DownloadEvent::Updated(t.clone()));
+                }
+                None => {
+                    return Err(ScraperError::IoError(format!("Task {} introuvable", id)));
+                }
             }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-
-        let task = {
-            let tasks = self.tasks.read().await;
-            tasks.iter().find(|t| t.id == id).cloned()
-        };
-
-        let Some(task) = task else {
-            return;
-        };
-
-        if matches!(task.status, DownloadStatus::Cancelled) {
-            return;
-        }
-
-        self.update_task_status(&id, DownloadStatus::Extracting)
-            .await;
-
-        let source = match self.scraper.extract_video_source(&task.url).await {
-            Ok(s) => s,
-            Err(e) => {
-                let error_msg = e.to_string();
-                self.update_task_status(&id, DownloadStatus::Failed(error_msg))
-                    .await;
-                return;
-            }
-        };
 
         if self.is_cancelled(&id).await {
-            return;
+            return Ok(());
         }
 
-        let id_clone = id.clone();
-        let update_tx = self.update_tx.clone();
-        let tasks = self.tasks.clone();
-        let output = task.output_path.clone();
+        let source = self.scraper.extract_video_source(&iframe_url).await?;
 
+        if self.is_cancelled(&id).await {
+            return Ok(());
+        }
+
+        let output = match self.tasks.read().await.iter().find(|t| t.id == id).map(|t| t.output_path.clone()) {
+            Some(p) => p,
+            None => return Err(ScraperError::IoError(format!("Task {} disparue", id))),
+        };
+
+        self.update_task_status(&id, DownloadStatus::Queued).await;
+        let _permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| ScraperError::IoError(e.to_string()))?;
+
+        if self.is_cancelled(&id).await {
+            return Ok(());
+        }
+
+        let id_for_callback = id.clone();
+        let update_tx = self.update_tx.clone();
+        let output_for_callback = output.clone();
+        let url_for_callback = source.url.clone();
+
+        let cancel = self.cancel_signal_for(&id).await;
         let result = self
             .downloader
             .download(
                 &source,
-                &output.clone(),
+                &output,
                 Some(Box::new(move |progress| {
-                    let progress_clone = progress.clone();
-
                     let task = DownloadTask {
-                        id: id_clone.clone(),
-                        url: String::new(),
-                        output_path: output.clone(),
-                        status: DownloadStatus::Downloading(progress_clone.clone()),
+                        id: id_for_callback.clone(),
+                        url: url_for_callback.clone(),
+                        output_path: output_for_callback.clone(),
+                        status: DownloadStatus::Downloading(progress),
+                        host: None,
+                        attempted_lecteurs: Vec::new(),
                     };
-
-                    let _ = update_tx.send(task);
-
-                    let tasks = tasks.clone();
-                    let id = id_clone.clone();
-                    tokio::spawn(async move {
-                        let mut tasks = tasks.write().await;
-                        if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
-                            t.status = DownloadStatus::Downloading(progress_clone);
-                        }
-                    });
+                    let _ = update_tx.send(DownloadEvent::Updated(task));
                 })),
+                Some(cancel),
             )
             .await;
 
         match result {
-            Ok(_) if !self.is_cancelled(&id).await => {
-                self.update_task_status(&id, DownloadStatus::Completed)
-                    .await;
+            Ok(_) => {
+                if !self.is_cancelled(&id).await {
+                    self.update_task_status(&id, DownloadStatus::Completed).await;
+                }
+                Ok(())
             }
-            Err(e) if !self.is_cancelled(&id).await => {
-                let error_msg = e.to_string();
-                self.update_task_status(&id, DownloadStatus::Failed(error_msg))
-                    .await;
-            }
-            _ => {}
+            Err(e) => Err(e),
         }
+    }
+
+    pub async fn mark_failed(&self, id: &str, msg: String) {
+        self.update_task_status(id, DownloadStatus::Failed(msg)).await;
+    }
+
+    pub async fn download_direct(&self, id: String, video_url: String) -> Result<()> {
+        {
+            let mut tasks = self.tasks.write().await;
+            match tasks.iter_mut().find(|t| t.id == id) {
+                Some(t) => {
+                    t.url = video_url.clone();
+                    t.status = DownloadStatus::Queued;
+                    let _ = self.update_tx.send(DownloadEvent::Updated(t.clone()));
+                }
+                None => {
+                    return Err(ScraperError::IoError(format!("Task {} introuvable", id)));
+                }
+            }
+        }
+        if self.is_cancelled(&id).await {
+            return Ok(());
+        }
+        let output = match self
+            .tasks
+            .read()
+            .await
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.output_path.clone())
+        {
+            Some(p) => p,
+            None => return Err(ScraperError::IoError(format!("Task {} disparue", id))),
+        };
+        let _permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| ScraperError::IoError(e.to_string()))?;
+        if self.is_cancelled(&id).await {
+            return Ok(());
+        }
+        let source = VideoSource {
+            url: video_url.clone(),
+            provider: VideoProvider::Unknown,
+        };
+        let id_for_callback = id.clone();
+        let update_tx = self.update_tx.clone();
+        let output_for_callback = output.clone();
+        let url_for_callback = video_url.clone();
+        let cancel = self.cancel_signal_for(&id).await;
+        let result = self
+            .downloader
+            .download(
+                &source,
+                &output,
+                Some(Box::new(move |progress| {
+                    let task = DownloadTask {
+                        id: id_for_callback.clone(),
+                        url: url_for_callback.clone(),
+                        output_path: output_for_callback.clone(),
+                        status: DownloadStatus::Downloading(progress),
+                        host: None,
+                        attempted_lecteurs: Vec::new(),
+                    };
+                    let _ = update_tx.send(DownloadEvent::Updated(task));
+                })),
+                Some(cancel),
+            )
+            .await;
+        match result {
+            Ok(_) => {
+                if !self.is_cancelled(&id).await {
+                    self.update_task_status(&id, DownloadStatus::Completed).await;
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn cancel(&self, id: &str) {
+        if let Some(notify) = self.cancel_signals.lock().await.get(id).cloned() {
+            notify.notify_waiters();
+        }
+        self.update_task_status(id, DownloadStatus::Cancelled).await;
+    }
+
+    pub async fn forget(&self, id: &str) {
+        let mut tasks = self.tasks.write().await;
+        tasks.retain(|t| t.id != id);
+        let _ = self.update_tx.send(DownloadEvent::Removed(id.to_string()));
     }
 
     async fn update_task_status(&self, id: &str, status: DownloadStatus) {
         let mut tasks = self.tasks.write().await;
         if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
             task.status = status;
-            self.notify_update(task.clone());
+            let _ = self.update_tx.send(DownloadEvent::Updated(task.clone()));
         }
     }
 
@@ -631,20 +1324,6 @@ impl DownloadManager {
             .find(|t| t.id == id)
             .map(|t| matches!(t.status, DownloadStatus::Cancelled))
             .unwrap_or(false)
-    }
-
-    fn notify_update(&self, task: DownloadTask) {
-        let _ = self.update_tx.send(task);
-    }
-
-    fn clone_for_task(&self) -> Self {
-        Self {
-            scraper: self.scraper.clone(),
-            downloader: self.downloader.clone(),
-            tasks: self.tasks.clone(),
-            max_concurrent: self.max_concurrent,
-            update_tx: self.update_tx.clone(),
-        }
     }
 }
 
@@ -672,7 +1351,18 @@ impl VideoDownloader {
         source: &VideoSource,
         output: P,
         progress_callback: Option<ProgressCallback>,
+        cancel: Option<Arc<tokio::sync::Notify>>,
     ) -> Result<()> {
+        if is_hls_url(&source.url) {
+            return download_hls(
+                &source.url,
+                output.as_ref(),
+                progress_callback.as_ref(),
+                cancel,
+            )
+            .await;
+        }
+
         let mut attempts = 0;
         let mut delay = self.retry_config.initial_delay_ms;
 
@@ -753,8 +1443,10 @@ impl VideoDownloader {
             }
 
             let now = std::time::Instant::now();
-            if let Some(ref callback) = progress_callback {
-                if now.duration_since(last_update).as_millis() >= 100 || downloaded == total_size {
+            if let Some(callback) = progress_callback {
+                if now.duration_since(last_update).as_millis() >= 250
+                    || (total_size > 0 && downloaded >= total_size)
+                {
                     let elapsed_secs = start_time.elapsed().as_secs_f64();
                     let speed = if elapsed_secs > 0.0 {
                         (downloaded as f64 / elapsed_secs) as u64
@@ -763,7 +1455,7 @@ impl VideoDownloader {
                     };
 
                     let eta = if speed > 0 && total_size > downloaded {
-                        ((total_size - downloaded) / speed)
+                        total_size.saturating_sub(downloaded) / speed
                     } else {
                         0
                     };
@@ -779,6 +1471,7 @@ impl VideoDownloader {
                         },
                         speed_bytes_per_sec: speed,
                         eta_seconds: eta,
+                        resolution: None,
                     });
 
                     last_update = now;
@@ -792,14 +1485,6 @@ impl VideoDownloader {
 
         Ok(())
     }
-
-    pub async fn download_simple<P: AsRef<Path>>(
-        &self,
-        source: &VideoSource,
-        output: P,
-    ) -> Result<()> {
-        self.download(source, output, None).await
-    }
 }
 
 impl Default for VideoDownloader {
@@ -808,107 +1493,384 @@ impl Default for VideoDownloader {
     }
 }
 
+fn is_hls_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    let path = lower.split('?').next().unwrap_or(&lower);
+    path.ends_with(".m3u8") || path.ends_with(".m3u")
+}
+
+static FFMPEG_TIME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+        .expect("valid ffmpeg time regex")
+});
+static FFMPEG_SPEED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"speed=\s*([0-9.]+)x").expect("valid ffmpeg speed regex")
+});
+
+#[derive(Debug, Clone)]
+struct HlsVariant {
+    url: String,
+    bandwidth: u64,
+    resolution: Option<String>,
+}
+
+fn join_url(base: &str, rel: &str) -> String {
+    if rel.starts_with("http://") || rel.starts_with("https://") {
+        return rel.to_string();
+    }
+    if let Some(scheme_end) = base.find("://") {
+        if let Some(host_end) = base[scheme_end + 3..].find('/') {
+            let scheme_host = &base[..scheme_end + 3 + host_end];
+            if rel.starts_with('/') {
+                return format!("{}{}", scheme_host, rel);
+            }
+            let dir_end = base.rfind('/').unwrap_or(base.len());
+            return format!("{}/{}", &base[..dir_end], rel);
+        }
+    }
+    rel.to_string()
+}
+
+fn parse_master_m3u8(content: &str, base_url: &str) -> Vec<HlsVariant> {
+    let mut out = Vec::new();
+    let mut pending: Option<(u64, Option<String>)> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with("#EXT-X-STREAM-INF:") {
+            let attrs = &line["#EXT-X-STREAM-INF:".len()..];
+            let mut bandwidth: u64 = 0;
+            let mut resolution: Option<String> = None;
+            for part in split_csv_attrs(attrs) {
+                if let Some(rest) = part.strip_prefix("BANDWIDTH=") {
+                    bandwidth = rest.trim_matches('"').parse().unwrap_or(0);
+                } else if let Some(rest) = part.strip_prefix("RESOLUTION=") {
+                    resolution = Some(rest.trim_matches('"').to_string());
+                }
+            }
+            pending = Some((bandwidth, resolution));
+        } else if !line.is_empty() && !line.starts_with('#') {
+            if let Some((bw, res)) = pending.take() {
+                out.push(HlsVariant {
+                    url: join_url(base_url, line),
+                    bandwidth: bw,
+                    resolution: res,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.bandwidth.cmp(&a.bandwidth));
+    out
+}
+
+fn split_csv_attrs(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(c);
+            }
+            ',' if !in_quotes => {
+                out.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current.trim().to_string());
+    }
+    out
+}
+
+async fn fetch_master_m3u8(url: &str) -> Result<String> {
+    let (referer, origin) = pick_hls_headers(url);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| ScraperError::NetworkError(e.to_string()))?;
+    let resp = client
+        .get(url)
+        .header("Referer", referer)
+        .header("Origin", origin)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        )
+        .send()
+        .await
+        .map_err(|e| ScraperError::NetworkError(e.to_string()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| ScraperError::NetworkError(e.to_string()))?;
+    Ok(text)
+}
+
+async fn download_hls(
+    url: &str,
+    output: &Path,
+    progress_callback: Option<&ProgressCallback>,
+    cancel: Option<Arc<tokio::sync::Notify>>,
+) -> Result<()> {
+    crate::applog::log_event(
+        crate::applog::LogSource::App,
+        crate::applog::LogLevel::Info,
+        format!("HLS détecté, fetch playlist: {}", url),
+    );
+
+    let mut variants: Vec<HlsVariant> = match fetch_master_m3u8(url).await {
+        Ok(content) => parse_master_m3u8(&content, url),
+        Err(e) => {
+            crate::applog::log_event(
+                crate::applog::LogSource::App,
+                crate::applog::LogLevel::Warn,
+                format!("Fetch master m3u8 KO ({}), tentative directe", e),
+            );
+            Vec::new()
+        }
+    };
+
+    if variants.is_empty() {
+        variants.push(HlsVariant {
+            url: url.to_string(),
+            bandwidth: 0,
+            resolution: None,
+        });
+    } else {
+        crate::applog::log_event(
+            crate::applog::LogSource::App,
+            crate::applog::LogLevel::Info,
+            format!(
+                "{} variant(s) trouvé(s) : {}",
+                variants.len(),
+                variants
+                    .iter()
+                    .map(|v| format!(
+                        "{} @ {}kbps",
+                        v.resolution.clone().unwrap_or_else(|| "?".to_string()),
+                        v.bandwidth / 1000
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+
+    let mut last_err: Option<ScraperError> = None;
+    for (idx, variant) in variants.iter().enumerate() {
+        crate::applog::log_event(
+            crate::applog::LogSource::App,
+            crate::applog::LogLevel::Info,
+            format!(
+                "Tentative variant {}/{} : {} ({}kbps)",
+                idx + 1,
+                variants.len(),
+                variant.resolution.clone().unwrap_or_else(|| "?".to_string()),
+                variant.bandwidth / 1000
+            ),
+        );
+        match run_ffmpeg_hls(
+            &variant.url,
+            variant.resolution.clone(),
+            output,
+            progress_callback,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Warn,
+                    format!(
+                        "Variant {} ({}) a échoué: {}",
+                        idx + 1,
+                        variant
+                            .resolution
+                            .clone()
+                            .unwrap_or_else(|| "?".to_string()),
+                        e
+                    ),
+                );
+                last_err = Some(e);
+                continue;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        ScraperError::NetworkError("Aucun variant HLS n'a abouti".into())
+    }))
+}
+
+fn pick_hls_headers(url: &str) -> (&'static str, &'static str) {
+    let lower = url.to_lowercase();
+    if lower.contains("mediacache.cc") || lower.contains("uniquestream") {
+        (
+            "https://anime.uniquestream.net/",
+            "https://anime.uniquestream.net",
+        )
+    } else if lower.contains("voir-anime") {
+        ("https://voir-anime.to/", "https://voir-anime.to")
+    } else if lower.contains("vidmoly") {
+        ("https://vidmoly.biz/", "https://vidmoly.biz")
+    } else if lower.contains("sibnet") {
+        ("https://video.sibnet.ru/", "https://video.sibnet.ru")
+    } else if lower.contains("anikuro") {
+        ("https://anikuro.to/", "https://anikuro.to")
+    } else {
+        ("https://franime.fr/", "https://franime.fr")
+    }
+}
+
+async fn run_ffmpeg_hls(
+    url: &str,
+    resolution: Option<String>,
+    output: &Path,
+    progress_callback: Option<&ProgressCallback>,
+    cancel: Option<Arc<tokio::sync::Notify>>,
+) -> Result<()> {
+    let (referer, origin) = pick_hls_headers(url);
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("info")
+        .arg("-stats")
+        .arg("-headers")
+        .arg(format!("Referer: {}\r\nOrigin: {}\r\n", referer, origin))
+        .arg("-i")
+        .arg(url)
+        .arg("-c")
+        .arg("copy")
+        .arg("-bsf:a")
+        .arg("aac_adtstoasc")
+        .arg(output)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ScraperError::IoError(format!("ffmpeg introuvable: {}", e)))?;
+
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ScraperError::IoError("ffmpeg stderr pipe absent".into()))?;
+
+    let start = std::time::Instant::now();
+    let mut reader = tokio::io::BufReader::new(stderr).lines();
+    let mut last_emit = std::time::Instant::now();
+    let mut was_cancelled = false;
+    loop {
+        let line_fut = reader.next_line();
+        tokio::pin!(line_fut);
+        let cancelled = match &cancel {
+            Some(n) => {
+                let notified = n.notified();
+                tokio::pin!(notified);
+                tokio::select! {
+                    line_result = &mut line_fut => Some(line_result),
+                    _ = &mut notified => None,
+                }
+            }
+            None => Some(line_fut.await),
+        };
+        let line_result = match cancelled {
+            Some(r) => r,
+            None => {
+                was_cancelled = true;
+                let _ = child.kill().await;
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Warn,
+                    "ffmpeg killé par signal de cancel",
+                );
+                break;
+            }
+        };
+        let line = match line_result {
+            Ok(Some(l)) => l,
+            _ => break,
+        };
+        if let Some(cb) = progress_callback {
+            if last_emit.elapsed().as_millis() >= 400 {
+                let seconds_processed = FFMPEG_TIME_RE.captures(&line).map(|c| {
+                    let h: u64 = c.get(1).unwrap().as_str().parse().unwrap_or(0);
+                    let m: u64 = c.get(2).unwrap().as_str().parse().unwrap_or(0);
+                    let s: u64 = c.get(3).unwrap().as_str().parse().unwrap_or(0);
+                    h * 3600 + m * 60 + s
+                });
+                if let Some(secs) = seconds_processed {
+                    let speed = FFMPEG_SPEED_RE
+                        .captures(&line)
+                        .and_then(|c| c.get(1).map(|m| m.as_str().parse::<f64>().unwrap_or(1.0)))
+                        .unwrap_or(1.0);
+                    let progress = DownloadProgress {
+                        id: String::new(),
+                        downloaded: secs,
+                        total: 0,
+                        percentage: 0.0,
+                        speed_bytes_per_sec: (speed * 1024.0 * 1024.0) as u64,
+                        eta_seconds: 0,
+                        resolution: resolution.clone(),
+                    };
+                    cb(progress);
+                    last_emit = std::time::Instant::now();
+                }
+            }
+        }
+        if line.to_lowercase().contains("error")
+            || line.to_lowercase().contains("invalid data")
+        {
+            crate::applog::log_event(
+                crate::applog::LogSource::App,
+                crate::applog::LogLevel::Warn,
+                format!("ffmpeg: {}", line),
+            );
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| ScraperError::IoError(format!("ffmpeg wait: {}", e)))?;
+    if was_cancelled {
+        return Err(ScraperError::NetworkError("Cancelled".into()));
+    }
+    if !status.success() {
+        return Err(ScraperError::NetworkError(format!(
+            "ffmpeg a échoué (code {:?}) après {:.1}s",
+            status.code(),
+            start.elapsed().as_secs_f32()
+        )));
+    }
+    crate::applog::log_event(
+        crate::applog::LogSource::App,
+        crate::applog::LogLevel::Info,
+        format!(
+            "HLS terminé en {:.1}s ({}): {}",
+            start.elapsed().as_secs_f32(),
+            resolution.clone().unwrap_or_else(|| "?".to_string()),
+            output.display()
+        ),
+    );
+    Ok(())
+}
+
 fn create_progress_bar(total: u64) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})"
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
         )
-            .unwrap()
-            .progress_chars("=> "),
+        .unwrap()
+        .progress_chars("=> "),
     );
     pb
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    simple_download_example().await?;
-
-    Ok(())
-}
-
-async fn simple_download_example() -> Result<()> {
-    let url = "https://franime.fr/watch2/?a=NjgzODNmM2EzYjY3NmM2NjY5M2MzZDNiM2E2NzNhMzgzYTNkNjk2YTZlM2I2ZTZkNjgzYjY5NmYzODM4NmI2ZDM4NmE2ZTY2NmI2ZTZiNmY2OTY5NmQ2ZDY2M2YzZjY5M2I2ZjNjM2E2NjNhNmY2ODNkNmM2YjY5NjYzYjZjM2YzYTY5NmIzYQ%3D%3D&b=MzYyYTJhMmUyZDY0NzE3MTM4MzczMjNiMzMzMTMxMzA3MDJhMzE3MTNiNzEzMDZmMzEzMzJkNjk2YjMzMzQzYzI0MmI%3D&c=NjY2ZjY5M2I2ZjZjM2I2ZTNhNmM2ZDY4NmE2OTZiM2QzODZhNmYzZDZjNmQ2OTZiM2M2YjM4NmY2YzZhMzg2YjNiM2I2ZDZhMzg2YzNjM2E2YTZlM2M2ODNkNmY2NzM4M2YzODM4M2I2YjNmNmQ2YTNmNjgzYjNiNjg2YTZiM2M2YTM4MzgzZA%3D%3D&d=MDRiNGFhZThlMTQ3MTY2MDJlN2M1OTQxNDMwMjU3MWFkN2M3ZDg4ZmFiNmVmOWQ5NTYxYjYzMzJhOTgyM2JjMjlhZGMxMzE0OTliYjMwZDkwODM3ZTdiYQ%3D%3D&e=Njk2YjNiM2MzYjY2NjgzYzY2NmYzYTZkNjg2ZTY4NmYzYzY4M2I2YjNmM2Q2ZjZmM2Y2OTNmM2Y2ODNkNmY2YjZiM2Y2NjNiNjg2ZjY3NmM2NjNmNmQ2ZDY5NjczYTNhM2M2YTY2NmQ2NzZlM2EzYTZhMzgzZjNm&f=Njk2YzY3NmU2YzZlM2EzYTZhNjczYjNiM2E2YTNjNjYzZjY4NmQzYzZlNmIzODNjM2M2YzNkNmE2ZjNmNmMzYzNkNmYzYTZmNmUzODY2NmY2OTZjMzgzYjZkNjY2ZjZjNjY2ZjZiNjYzYTZhM2MzZjNhNmI2ODY4NmI2YzY2NmUzYTZiNmM2NjNhM2QzZDNkM2EzYTZmNmY2YjZlNmQzYjNmNmQ2YjY4Mzg2ZDNmNmQ2ZTNiM2YzZjY2M2QzYjM4Njg2YjNkNmEzYTY3NmEzYjY2NmE2ZDY4&g=NmE2YzZlM2Q2ZDZlNmEzZDZiM2EzYzY2NmQ2YjNiM2Y2ZjNhNmYzZjZjNmQ2NzZkNjgzYzNkNmQ2NjNiMzgzYTY5NmE2ODNjNjY2OTNiNmUzZjY2NjY2ZDZhMzg2YzY2M2M2ODY3NmI2OTNmNjY2YTZkMzgzYTZjM2Q2NzZhNjc2YTY5NmYzYjZmM2E2ODY2MzgzZjZjM2IzZDNiMzgzYjM4Njk2ZjZhNjk2ZjY3M2Q2ZjZkMzg2ZTY2M2E%3D&h=NjgzYjZmM2M2NjZiNjkzZjY5M2I2YjNmMzgzZDNkNmY2ZjZhNjc2ODNjNjkzZjY4Mzg2ZTZjNjc2ZDZlNmE2NzNjNmE2ZDNjM2MzYTNiNmEzZjZiNjg2NzNmNjgzYTY3NmI2NzNmM2MzYTY4NmU2YjZmNjk2ZTY3M2I2OQ%3D%3D&i=ZDdlNWU4MDFkOGE3OWI4ZGI0ODY0ZDk2Zjc0ZjlhZmQwMDhlMmFiZWIxNGUxMDg4YmMyNDgxOTI5YTFhODU4MTJmOTkyZjRjYzljNzZlMmUzYTc4ZjJlMDhkYTM%3D&j=ZmIyZDViYzc1MGMyZjU5OTA0NGJiYTZjNTk4NDBjNGM4Mzk4NGUzMDJmOWM1MmE0NWFlYjM3NmNhYmI5MTk5ZTUwYzc4N2RhZjBlNw%3D%3D&k=NjkzZDZhM2IzYjNkM2QzYjNkNjczYjZmNmI2YTY5NmI2YjZiNmQ2ODY3NjgzZjZmM2MzYTZkNmM2YzY2Mzg2ZTZjNmM2ZTNmM2QzZjZkM2I2NjZkNjg2ZDZmMzgzODZhNmM2ZDY5M2E2NzZjNmI2YTY3M2QzODNiNmI2ZDM4NmIzYjZlNmQ2YzNjM2I2ZTZiNmMzZDNhNjc2ZjY2NmIzYzNmM2QzYTY5Mzg2ZA%3D%3D&l=M2IzYzY5NmIzYTZlM2I2ZDNmNmY2YzY4M2IzODZiM2QzYjY5NjgzZjNjNjg2NjZkM2E2YjZhNjc2OTM4M2Q2OTNjM2I2ZjNjNjczZDZlM2Y2ZTZlM2E2YTNiNmM2ZjZmNmU2NjZjM2I2ODY3NjgzZjY3NmE2NzNmNjk2NzZjNjYzZDZiMzgzYTNkNmI2YTM4M2E2ZTNhM2M2ZDY2M2Q2ODM4NmQzZDY4NmMzZjY5NmIzYTNkNmMzZjM4M2IzYzNj&m=OWZjMTAxNjBjY2FjMjQ1ZWQ0MDBiNTA0ZTRhMGZkNDE3MWE1ZjQ0NzM4ZmNlOTdjNTJjMzhkN2Q2MDZhODI0MGI1OGRhMjdhN2E1&n=NmIzZjNmNjg2YTZiNjczODZmNjczYzM4NmM2YTZkM2EzZDZjM2Y2ZTNmM2M2OTY5NmUzYjY4Njg2YjZiNmEzYzZjMzg2NzZkM2M2OTZiNmUzYTNjM2Y2NjZiNjczZDZhNjg2ZDZmNmUzYzNhNmY2ZjZmNmIzYzNhNmUzODM4NjkzZjZlNjc2ZDM4M2Y2ODZjNmEzZjZlNjY2YjNiNjk2YjNhM2YzYTY5NmMzZjY2Njg2NjNiNmE2NjY2M2IzODZlNmI2ZjY3NmE2ZjNmM2Y2ODZhNjgzZDNmNjg2ZTZmNmU2ZTNk&o=OWRmMWEzMTdhYjdkYTEyMWRhYzZjMzdlOGYyYWJhNTUyZGZhOWU0NzI0NTU5NTg2Y2ViYWNkZjcxYWE1OWUwNWIzMjg2YWE5";
-
-    let scraper = FranimeScraper::new(false).await?;
-
-    println!("Extraction de la source vidéo...");
-    let source = scraper.extract_video_source(url).await?;
-    println!("Source trouvée: {:?}", source.provider);
-    println!("URL: {}", source.url);
-
-    let downloader = VideoDownloader::new();
-    println!("Téléchargement en cours...");
-    downloader.download_simple(&source, "video.mp4").await?;
-    println!("Téléchargement terminé!");
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn multi_download_example() -> Result<()> {
-    let (manager, mut updates) = DownloadManager::new(true, 3).await?;
-
-    let urls = vec![
-        ("https://franime.fr/watch2/?a=...", "video1.mp4"),
-        ("https://franime.fr/watch2/?b=...", "video2.mp4"),
-        ("https://franime.fr/watch2/?c=...", "video3.mp4"),
-    ];
-
-    for (url, output) in urls {
-        let id = manager
-            .add_download(url.to_string(), output.to_string(), "".to_string())
-            .await;
-        println!("Tâche ajoutée: {}", id);
-    }
-
-    tokio::spawn(async move {
-        while let Some(task) = updates.recv().await {
-            match task.status {
-                DownloadStatus::Queued => {
-                    println!("[{}] En attente...", task.id);
-                }
-                DownloadStatus::Extracting => {
-                    println!("[{}] Extraction de la source...", task.id);
-                }
-                DownloadStatus::Downloading(ref progress) => {
-                    println!(
-                        "[{}] Téléchargement: {:.1}% ({} MB/s, ETA: {}s)",
-                        task.id,
-                        progress.percentage,
-                        progress.speed_bytes_per_sec / 1_000_000,
-                        progress.eta_seconds
-                    );
-                }
-                DownloadStatus::Completed => {
-                    println!("[{}] ✓ Terminé!", task.id);
-                }
-                DownloadStatus::Failed(ref err) => {
-                    eprintln!("[{}] ✗ Échec: {}", task.id, err);
-                }
-                DownloadStatus::Cancelled => {
-                    println!("[{}] Annulé", task.id);
-                }
-            }
-        }
-    });
-
-    loop {
-        let tasks = manager.get_tasks().await;
-        let all_done = tasks.iter().all(|t| {
-            matches!(
-                t.status,
-                DownloadStatus::Completed | DownloadStatus::Failed(_) | DownloadStatus::Cancelled
-            )
-        });
-
-        if all_done {
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-
-    println!("Tous les téléchargements sont terminés!");
-    Ok(())
 }

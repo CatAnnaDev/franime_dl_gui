@@ -67,7 +67,7 @@ def _score_video_url(url: str, mime: str) -> int:
     return score
 
 
-async def capture_video_url(tab, url: str, timeout: float = 25.0) -> str:
+async def capture_video_url(tab, url: str, timeout: float = 25.0, referer: str = "") -> str:
     log(f"  capture: navigate {url[:90]}")
     captured: list = []
 
@@ -89,6 +89,17 @@ async def capture_video_url(tab, url: str, timeout: float = 25.0) -> str:
         await tab.send(cdp.network.enable())
     except Exception as e:
         log(f"  capture: network handler setup failed: {e}")
+
+    if referer:
+        try:
+            await tab.send(
+                cdp.network.set_extra_http_headers(
+                    headers=cdp.network.Headers({"Referer": referer})
+                )
+            )
+            log(f"  capture: referer set {referer[:50]}")
+        except Exception as e:
+            log(f"  capture: set referer failed: {e}")
 
     try:
         await tab.get(url)
@@ -287,9 +298,10 @@ async def main_loop() -> int:
                     write_response({"id": cmd_id, "error": str(e)})
             elif op == "capture_video_url":
                 url = cmd.get("url", "")
-                log(f"capture_video_url id={cmd_id} url={url[:80]}")
+                referer = cmd.get("referer", "") or ""
+                log(f"capture_video_url id={cmd_id} url={url[:80]} ref={referer[:40]}")
                 try:
-                    src = await capture_video_url(tab, url)
+                    src = await capture_video_url(tab, url, referer=referer)
                     write_response({"id": cmd_id, "video_url": src})
                 except Exception as e:
                     log(f"capture_video_url error: {e}")

@@ -132,6 +132,25 @@ impl VaClient {
         parse_iframe(&html).ok_or(VaError::NoIframe)
     }
 
+    pub async fn fetch_sitemap_index(&self) -> Result<Vec<(String, String)>, VaError> {
+        let xml = self.get_html(&format!("{}/sitemap_index.xml", BASE)).await?;
+        Ok(parse_sitemap_pairs(&xml))
+    }
+
+    pub async fn fetch_series_sitemap(
+        &self,
+        url: &str,
+    ) -> Result<Vec<(String, String)>, VaError> {
+        let xml = self.get_html(url).await?;
+        let mut out = Vec::new();
+        for (loc, lastmod) in parse_sitemap_pairs(&xml) {
+            if let Some(slug) = slug_from_anime_url(&loc) {
+                out.push((slug, lastmod));
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn episode_sources(&self, episode_url: &str) -> Result<Vec<VaSource>, VaError> {
         let html = self.get_html(episode_url).await?;
         let mut sources = parse_chapter_sources(&html);
@@ -147,6 +166,32 @@ impl VaClient {
         }
         Ok(sources)
     }
+}
+
+fn parse_sitemap_pairs(xml: &str) -> Vec<(String, String)> {
+    let re = match regex::Regex::new(
+        r"(?is)<loc>\s*(.*?)\s*</loc>\s*<lastmod>\s*(.*?)\s*</lastmod>",
+    ) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    re.captures_iter(xml)
+        .filter_map(|c| {
+            let loc = c.get(1)?.as_str().trim().to_string();
+            let lastmod = c.get(2)?.as_str().trim().to_string();
+            Some((loc, lastmod))
+        })
+        .collect()
+}
+
+fn slug_from_anime_url(url: &str) -> Option<String> {
+    let marker = "/anime/";
+    let idx = url.find(marker)?;
+    let slug = url[idx + marker.len()..].trim_end_matches('/');
+    if slug.is_empty() || slug.contains('/') {
+        return None;
+    }
+    Some(slug.to_string())
 }
 
 fn parse_list(html: &str) -> Vec<VaSeries> {

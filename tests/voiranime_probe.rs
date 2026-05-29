@@ -65,6 +65,30 @@ async fn probe_raw_bytes() {
 
 #[tokio::test]
 #[ignore]
+async fn probe_sitemap() {
+    let client = voiranime::VaClient::new().unwrap();
+    let index = client.fetch_sitemap_index().await.unwrap();
+    println!("sitemap_index: {} entries", index.len());
+    let series: Vec<&(String, String)> = index
+        .iter()
+        .filter(|(loc, _)| loc.contains("wp-manga-sitemap"))
+        .collect();
+    println!("series sub-sitemaps: {}", series.len());
+    for (loc, lastmod) in &series {
+        println!("  {} | {}", loc, lastmod);
+    }
+    let first = series.first().unwrap();
+    let entries = client.fetch_series_sitemap(&first.0).await.unwrap();
+    println!("first series sitemap '{}': {} animes", first.0, entries.len());
+    for (slug, lastmod) in &entries[..5.min(entries.len())] {
+        println!("  - {} | {}", slug, lastmod);
+    }
+    assert!(series.len() >= 5);
+    assert!(entries.len() >= 100);
+}
+
+#[tokio::test]
+#[ignore]
 async fn probe_episode_sources() {
     let client = voiranime::VaClient::new().unwrap();
     let sources = client

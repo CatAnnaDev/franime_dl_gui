@@ -5,7 +5,7 @@ use chromiumoxide::cdp::browser_protocol::network::{
 use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::js::EvaluationResult;
-use chromiumoxide::{browser, Browser, BrowserConfig, Page};
+use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
@@ -18,6 +18,8 @@ use tokio::sync::{mpsc, OnceCell, RwLock, Semaphore};
 
 const DEFAULT_CHROME_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+const MIN_VALID_DOWNLOAD_BYTES: u64 = 100_000;
 
 pub const FRANIME_CF_CLEARANCE_FALLBACK: &str = "XWyNnG2HZ0mdGGKuERIMy7maoxBx_a8Mgxo.4IesuVk-1779817968-1.2.1.1-dUqG8LY74pbxbbt0SDpbEA.guo1IuBxVJlJNwHECNgeHpoNW4ahwTeF.N2Qp6HIQTnngjXn.xdtm4blz0FCXvoGLKFg0V5XFhOWrx8e3FgOzGyxcShCgw1pR4mopjkp99_LrGtqpz0XIdlC8RgPD69ELxptHL35NriIL.E9xz1eV91c3eJ9cVZgHCsqngJxaaGQj1NZZQwNigm_m3ON3OgjpoLzjdst5IVeTGiIFZ.EQE0TlY5iWhlyDYHKz8tQmND2wRd_NyulTqXfKMQeZ0My2P4uhutyqeirUAbnO_62wZSghqWvbXaPTzgSY81VPc28x_3zraTeS9rEZ1LGyBg";
 
@@ -192,6 +194,20 @@ static VIDMOLY_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"sources\s*:\s*\[\s*\{\s*file\s*:\s*["']([^"']+)["']"#)
         .expect("valid vidmoly regex")
 });
+static JW_FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"["']?file["']?\s*:\s*["'](https?://[^"']+|//[^"']+)["']"#)
+        .expect("valid jwplayer file regex")
+});
+
+const HTTP_SCRAPE_HOSTS: &[&str] = &[
+    "vidmoly",
+    "yourupload",
+    "mp4upload",
+    "vudeo",
+    "upstream",
+    "vupload",
+    "uqload",
+];
 static GENERIC_MP4_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(https?://[^"'\s<>]+\.(?:mp4|m3u8)(?:\?[^"'\s<>]*)?)"#)
         .expect("valid generic mp4 regex")
@@ -361,6 +377,35 @@ impl HttpExtractor {
         GENERIC_MP4_RE
             .find(&html)
             .map(|m| m.as_str().to_string())
+    }
+
+    async fn try_http_scrape(&self, url: &str, referer: &str) -> Option<String> {
+        let ua = self.cookies.user_agent().await;
+        let mut req = self.client.get(url).header("User-Agent", ua);
+        if !referer.is_empty() {
+            req = req.header("Referer", referer);
+        }
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let html = resp.text().await.ok()?;
+        if let Some(c) = VIDMOLY_SOURCE_RE.captures(&html) {
+            if let Some(m) = c.get(1) {
+                return Some(normalize_scheme(m.as_str()));
+            }
+        }
+        if let Some(c) = JW_FILE_RE.captures(&html) {
+            if let Some(m) = c.get(1) {
+                let v = m.as_str();
+                if v.contains(".mp4") || v.contains(".m3u8") {
+                    return Some(normalize_scheme(v));
+                }
+            }
+        }
+        GENERIC_MP4_RE
+            .find(&html)
+            .map(|m| normalize_scheme(m.as_str()))
     }
 
     async fn try_sendvid(&self, iframe_src: &str) -> Option<String> {
@@ -709,6 +754,81 @@ impl FranimeScraper {
         })
     }
 
+    pub async fn extract_video_source_from_embed(
+        &self,
+        embed_url: &str,
+        referer: &str,
+    ) -> Result<VideoSource> {
+        self.retry_operation(|| self.extract_embed_impl(embed_url, referer))
+            .await
+    }
+
+    async fn extract_embed_impl(&self, embed_url: &str, referer: &str) -> Result<VideoSource> {
+        let provider = classify_provider(embed_url);
+        let lower = embed_url.to_lowercase();
+        crate::applog::log_event(
+            crate::applog::LogSource::App,
+            crate::applog::LogLevel::Info,
+            format!("embed direct: {} (ref={})", embed_url, referer),
+        );
+
+        let make = |url: String| VideoSource {
+            url,
+            provider,
+        };
+
+        if lower.contains("sibnet.ru") {
+            if let Some(u) = self.http.try_sibnet(embed_url).await {
+                return Ok(make(u));
+            }
+        } else if lower.contains("sendvid") {
+            if let Some(u) = self.http.try_sendvid(embed_url).await {
+                return Ok(make(u));
+            }
+        } else if HTTP_SCRAPE_HOSTS.iter().any(|h| lower.contains(h)) {
+            if let Some(u) = self.http.try_http_scrape(embed_url, referer).await {
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Info,
+                    format!("embed HTTP scrape OK: {}", &u[..u.len().min(120)]),
+                );
+                return Ok(make(u));
+            }
+        }
+
+        match crate::ytdlp::extract_url(embed_url, referer).await {
+            Ok(u) if !u.is_empty() => {
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Info,
+                    format!("embed yt-dlp OK: {}", &u[..u.len().min(120)]),
+                );
+                return Ok(make(u));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Info,
+                    format!("embed yt-dlp KO ({}), fallback sidecar", e),
+                );
+            }
+        }
+
+        match self.sidecar_capture(embed_url, Some(referer)).await {
+            Ok(u) if !u.is_empty() => {
+                crate::applog::log_event(
+                    crate::applog::LogSource::App,
+                    crate::applog::LogLevel::Info,
+                    format!("embed sidecar capture OK: {}", &u[..u.len().min(120)]),
+                );
+                Ok(make(u))
+            }
+            Ok(_) => Err(ScraperError::VideoSourceNotFound),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn browser_iframe_src(&self, url: &str) -> Result<String> {
         self.ensure_sidecar().await?;
         self.sidecar.fetch_iframe(url).await.map_err(|e| {
@@ -722,7 +842,16 @@ impl FranimeScraper {
     }
 
     async fn extract_via_browser_or_ytdlp(&self, iframe_src: &str) -> Result<String> {
-        match self.sidecar_capture(iframe_src).await {
+        self.extract_via_browser_or_ytdlp_ref(iframe_src, "https://franime.fr/")
+            .await
+    }
+
+    async fn extract_via_browser_or_ytdlp_ref(
+        &self,
+        iframe_src: &str,
+        referer: &str,
+    ) -> Result<String> {
+        match self.sidecar_capture(iframe_src, Some(referer)).await {
             Ok(u) if !u.is_empty() => return Ok(u),
             Ok(_) => {
                 crate::applog::log_event(
@@ -744,7 +873,7 @@ impl FranimeScraper {
             crate::applog::LogLevel::Info,
             format!("yt-dlp sur {}", iframe_src),
         );
-        match crate::ytdlp::extract_url(iframe_src, "https://franime.fr/").await {
+        match crate::ytdlp::extract_url(iframe_src, referer).await {
             Ok(u) => {
                 crate::applog::log_event(
                     crate::applog::LogSource::App,
@@ -757,10 +886,10 @@ impl FranimeScraper {
         }
     }
 
-    async fn sidecar_capture(&self, iframe_src: &str) -> Result<String> {
+    async fn sidecar_capture(&self, iframe_src: &str, referer: Option<&str>) -> Result<String> {
         self.ensure_sidecar().await?;
         self.sidecar
-            .capture_video_url(iframe_src)
+            .capture_video_url(iframe_src, referer)
             .await
             .map_err(|e| {
                 crate::applog::log_event(
@@ -1157,7 +1286,39 @@ impl DownloadManager {
         }
 
         let source = self.scraper.extract_video_source(&iframe_url).await?;
+        self.download_source(id, source).await
+    }
 
+    pub async fn extract_and_download_embed(
+        &self,
+        id: String,
+        embed_url: String,
+        referer: String,
+    ) -> Result<()> {
+        {
+            let mut tasks = self.tasks.write().await;
+            match tasks.iter_mut().find(|t| t.id == id) {
+                Some(t) => {
+                    t.url = embed_url.clone();
+                    t.status = DownloadStatus::Extracting;
+                    let _ = self.update_tx.send(DownloadEvent::Updated(t.clone()));
+                }
+                None => {
+                    return Err(ScraperError::IoError(format!("Task {} introuvable", id)));
+                }
+            }
+        }
+        if self.is_cancelled(&id).await {
+            return Ok(());
+        }
+        let source = self
+            .scraper
+            .extract_video_source_from_embed(&embed_url, &referer)
+            .await?;
+        self.download_source(id, source).await
+    }
+
+    async fn download_source(&self, id: String, source: VideoSource) -> Result<()> {
         if self.is_cancelled(&id).await {
             return Ok(());
         }
@@ -1413,6 +1574,23 @@ impl VideoDownloader {
             .error_for_status()
             .map_err(|e| ScraperError::NetworkError(e.to_string()))?;
 
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+        if content_type.contains("text/html")
+            || content_type.contains("application/json")
+            || content_type.contains("text/plain")
+            || content_type.contains("application/xml")
+        {
+            return Err(ScraperError::NetworkError(format!(
+                "réponse non-vidéo (Content-Type: {})",
+                content_type
+            )));
+        }
+
         let total_size = resp.content_length().unwrap_or(0);
 
         let pb = if progress_callback.is_none() && total_size > 0 {
@@ -1479,8 +1657,25 @@ impl VideoDownloader {
             }
         }
 
+        file.flush()
+            .await
+            .map_err(|e| ScraperError::IoError(e.to_string()))?;
+        drop(file);
+
         if let Some(pb) = pb {
             pb.finish_with_message("Téléchargement terminé");
+        }
+
+        let written = tokio::fs::metadata(output.as_ref())
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if written < MIN_VALID_DOWNLOAD_BYTES {
+            let _ = tokio::fs::remove_file(output.as_ref()).await;
+            return Err(ScraperError::NetworkError(format!(
+                "fichier trop petit ({} octets), source probablement invalide",
+                written
+            )));
         }
 
         Ok(())
@@ -1490,6 +1685,15 @@ impl VideoDownloader {
 impl Default for VideoDownloader {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn normalize_scheme(url: &str) -> String {
+    let u = url.trim();
+    if u.starts_with("//") {
+        format!("https:{}", u)
+    } else {
+        u.to_string()
     }
 }
 
@@ -1716,12 +1920,18 @@ fn pick_hls_headers(url: &str) -> (&'static str, &'static str) {
         )
     } else if lower.contains("voir-anime") {
         ("https://voir-anime.to/", "https://voir-anime.to")
-    } else if lower.contains("vidmoly") {
+    } else if lower.contains("vidmoly") || lower.contains("vmeas") || lower.contains("vmwesa") {
         ("https://vidmoly.biz/", "https://vidmoly.biz")
     } else if lower.contains("sibnet") {
         ("https://video.sibnet.ru/", "https://video.sibnet.ru")
     } else if lower.contains("anikuro") {
         ("https://anikuro.to/", "https://anikuro.to")
+    } else if lower.contains("mail.ru") {
+        ("https://my.mail.ru/", "https://my.mail.ru")
+    } else if lower.contains("voe") || lower.contains("delivery-node") {
+        ("https://voe.sx/", "https://voe.sx")
+    } else if lower.contains("streamtape") || lower.contains("streamta.pe") || lower.contains("tapecontent") {
+        ("https://streamtape.com/", "https://streamtape.com")
     } else {
         ("https://franime.fr/", "https://franime.fr")
     }
@@ -1848,6 +2058,17 @@ async fn run_ffmpeg_hls(
             "ffmpeg a échoué (code {:?}) après {:.1}s",
             status.code(),
             start.elapsed().as_secs_f32()
+        )));
+    }
+    let written = tokio::fs::metadata(output)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if written < MIN_VALID_DOWNLOAD_BYTES {
+        let _ = tokio::fs::remove_file(output).await;
+        return Err(ScraperError::NetworkError(format!(
+            "HLS: fichier de sortie trop petit ({} octets), flux probablement invalide",
+            written
         )));
     }
     crate::applog::log_event(

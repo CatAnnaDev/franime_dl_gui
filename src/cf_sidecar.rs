@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 
 const RESULT_PREFIX: &str = "__FRANIME_RESULT__";
@@ -161,8 +161,13 @@ impl Sidecar {
         let python = std::env::var("FRANIME_PYTHON")
             .ok()
             .or_else(|| {
-                let venv = cwd.join(".venv").join("bin").join("python");
-                venv.exists().then(|| venv.to_string_lossy().into_owned())
+                [
+                    cwd.join(".venv").join("bin").join("python"),
+                    cwd.join(".venv").join("Scripts").join("python.exe"),
+                ]
+                .iter()
+                .find(|p| p.exists())
+                .map(|p| p.to_string_lossy().into_owned())
             })
             .unwrap_or_else(|| "python3".to_string());
 
@@ -335,8 +340,14 @@ impl Sidecar {
         }
     }
 
-    pub async fn capture_video_url(self: &Arc<Self>, url: &str) -> Result<String, SidecarError> {
-        let r = self.send_cmd("capture_video_url", Some(url)).await;
+    pub async fn capture_video_url(
+        self: &Arc<Self>,
+        url: &str,
+        referer: Option<&str>,
+    ) -> Result<String, SidecarError> {
+        let r = self
+            .send_cmd_ref("capture_video_url", Some(url), referer)
+            .await;
         match r {
             Ok(SidecarReply::VideoUrl(v)) if !v.is_empty() => {
                 self.fetch_ok.fetch_add(1, Ordering::SeqCst);
@@ -389,12 +400,24 @@ impl Sidecar {
         cmd: &str,
         url: Option<&str>,
     ) -> Result<SidecarReply, SidecarError> {
+        self.send_cmd_ref(cmd, url, None).await
+    }
+
+    async fn send_cmd_ref(
+        self: &Arc<Self>,
+        cmd: &str,
+        url: Option<&str>,
+        referer: Option<&str>,
+    ) -> Result<SidecarReply, SidecarError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
 
-        let payload = match url {
-            Some(u) => serde_json::json!({"id": id, "cmd": cmd, "url": u}),
-            None => serde_json::json!({"id": id, "cmd": cmd}),
+        let payload = match (url, referer) {
+            (Some(u), Some(r)) => {
+                serde_json::json!({"id": id, "cmd": cmd, "url": u, "referer": r})
+            }
+            (Some(u), None) => serde_json::json!({"id": id, "cmd": cmd, "url": u}),
+            (None, _) => serde_json::json!({"id": id, "cmd": cmd}),
         };
         let mut line = serde_json::to_string(&payload)?;
         line.push('\n');

@@ -131,9 +131,26 @@ pub struct EpisodeInfo {
 pub struct EpisodeMedia {
     #[serde(default)]
     pub title: Option<String>,
-    pub content_id: String,
+    #[serde(default)]
+    pub content_id: Option<String>,
     #[serde(default)]
     pub hls: Option<HlsBlock>,
+    #[serde(default)]
+    pub versions: Option<MediaVersions>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MediaVersions {
+    #[serde(default)]
+    pub hls: Vec<HlsVersion>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HlsVersion {
+    #[serde(default)]
+    pub locale: String,
+    #[serde(default)]
+    pub playlist: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,20 +299,112 @@ impl UsClient {
         movie_content_id: &str,
         locale: &str,
     ) -> Result<String, UsError> {
-        let url = format!(
-            "{}/movie/{}/media/hls/{}",
-            BASE, movie_content_id, locale
-        );
+        self.resolve_hls("movie", movie_content_id, locale, locale != "ja-JP")
+            .await
+    }
+
+    async fn fetch_media(&self, url: &str) -> Result<EpisodeMedia, UsError> {
         let text = self
             .client
-            .get(&url)
+            .get(url)
             .header("Accept", "application/json")
             .send()
             .await?
             .text()
             .await?;
-        let parsed: EpisodeMedia = serde_json::from_str(&text)?;
-        parsed.hls.map(|h| h.playlist).ok_or(UsError::NoHls)
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    async fn playlist_ready(&self, url: &str) -> bool {
+        match self
+            .client
+            .get(url)
+            .header("Referer", "https://anime.uniquestream.net/")
+            .header("Origin", "https://anime.uniquestream.net")
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    return false;
+                }
+                resp.text().await.map(|t| t.contains("#EXTM3U")).unwrap_or(false)
+            }
+            Err(_) => false,
+        }
+    }
+
+    async fn resolve_hls(
+        &self,
+        kind: &str,
+        id: &str,
+        desired: &str,
+        prefer_dub: bool,
+    ) -> Result<String, UsError> {
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        let mut collect = |m: &EpisodeMedia| {
+            if let Some(h) = &m.hls {
+                if !h.playlist.is_empty() {
+                    candidates.push((h.locale.clone(), h.playlist.clone()));
+                }
+            }
+            if let Some(v) = &m.versions {
+                for h in &v.hls {
+                    if !h.playlist.is_empty() {
+                        candidates.push((h.locale.clone(), h.playlist.clone()));
+                    }
+                }
+            }
+        };
+        if let Ok(m) = self
+            .fetch_media(&format!("{}/{}/{}/media/hls/{}", BASE, kind, id, desired))
+            .await
+        {
+            collect(&m);
+        }
+        if let Ok(m) = self
+            .fetch_media(&format!("{}/{}/{}/media/hls/zz-ZZ", BASE, kind, id))
+            .await
+        {
+            collect(&m);
+        }
+        candidates.sort_by(|a, b| a.1.cmp(&b.1));
+        candidates.dedup_by(|a, b| a.1 == b.1);
+        if candidates.is_empty() {
+            return Err(UsError::NoHls);
+        }
+
+        let rank = |loc: &str| -> i32 {
+            if loc == desired {
+                return 0;
+            }
+            if prefer_dub {
+                match loc {
+                    "fr-FR" => 1,
+                    "en-US" => 2,
+                    "es-ES" => 3,
+                    "es-419" => 4,
+                    "de-DE" => 5,
+                    "pt-BR" => 6,
+                    "it-IT" => 7,
+                    "ja-JP" => 50,
+                    _ => 20,
+                }
+            } else {
+                match loc {
+                    "ja-JP" => 1,
+                    _ => 20,
+                }
+            }
+        };
+        candidates.sort_by_key(|(l, _)| rank(l));
+
+        for (_loc, pl) in &candidates {
+            if self.playlist_ready(pl).await {
+                return Ok(pl.clone());
+            }
+        }
+        Err(UsError::NoHls)
     }
 
     pub async fn series(&self, content_id: &str) -> Result<SeriesDetail, UsError> {
@@ -371,20 +480,8 @@ impl UsClient {
         episode_content_id: &str,
         locale: &str,
     ) -> Result<String, UsError> {
-        let url = format!(
-            "{}/episode/{}/media/hls/{}",
-            BASE, episode_content_id, locale
-        );
-        let text = self
-            .client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await?
-            .text()
-            .await?;
-        let parsed: EpisodeMedia = serde_json::from_str(&text)?;
-        parsed.hls.map(|h| h.playlist).ok_or(UsError::NoHls)
+        self.resolve_hls("episode", episode_content_id, locale, locale != "ja-JP")
+            .await
     }
 }
 

@@ -18,9 +18,13 @@ pub enum YtDlpError {
 
 pub fn resolve_binary() -> String {
     if let Ok(p) = std::env::current_dir() {
-        let venv_bin = p.join(".venv").join("bin").join("yt-dlp");
-        if venv_bin.exists() {
-            return venv_bin.to_string_lossy().into_owned();
+        for c in [
+            p.join(".venv").join("bin").join("yt-dlp"),
+            p.join(".venv").join("Scripts").join("yt-dlp.exe"),
+        ] {
+            if c.exists() {
+                return c.to_string_lossy().into_owned();
+            }
         }
     }
     if let Ok(v) = std::env::var("FRANIME_YTDLP") {

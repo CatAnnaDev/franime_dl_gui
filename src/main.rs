@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::animes_api::{FullAnimeslist, Root2};
 use crate::downloader::{
     sanitize_path_segment, CookieStore, DownloadEvent, DownloadManager, DownloadStatus as DlStatus,
@@ -8,7 +10,6 @@ use eframe::egui;
 use egui::{Color32, ColorImage, RichText, Vec2};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::runtime::Runtime;
@@ -17,6 +18,7 @@ use tokio::sync::RwLock;
 
 mod anikuro;
 mod animes_api;
+mod animesama;
 mod applog;
 mod cf_sidecar;
 mod consumet;
@@ -51,6 +53,13 @@ pub struct UsStoredAnime {
 
 #[derive(Debug, Clone)]
 pub struct VaStoredAnime {
+    pub slug: String,
+    pub json_data: String,
+    pub episodes_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsStoredAnime {
     pub slug: String,
     pub json_data: String,
     pub episodes_json: Option<String>,
@@ -125,6 +134,9 @@ pub struct AppSettings {
     pub skip_existing: bool,
     pub theme_dark: bool,
     pub notifications_enabled: bool,
+    pub hide_nsfw: bool,
+    pub ui_scale: f32,
+    pub uniquestream_enabled: bool,
     pub sidecar_warmup: bool,
     pub consumet_base_url: String,
     pub consumet_provider: String,
@@ -136,11 +148,21 @@ pub struct AppSettings {
     pub anikuro_prefer_dub: bool,
 }
 
+fn detected_cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+fn default_max_concurrent_downloads() -> usize {
+    detected_cpu_count().clamp(3, 16)
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            max_concurrent_downloads: 4,
-            max_concurrent_extractions: 1,
+            max_concurrent_downloads: default_max_concurrent_downloads(),
+            max_concurrent_extractions: (detected_cpu_count() / 4).clamp(1, 3),
             preferred_lecteur_host: String::new(),
             download_dir: String::new(),
             chrome_headless: false,
@@ -148,6 +170,9 @@ impl Default for AppSettings {
             skip_existing: true,
             theme_dark: true,
             notifications_enabled: true,
+            hide_nsfw: true,
+            ui_scale: 1.0,
+            uniquestream_enabled: true,
             sidecar_warmup: false,
             consumet_base_url: String::new(),
             consumet_provider: "gogoanime".to_string(),
@@ -216,6 +241,25 @@ impl AppSettings {
                 .flatten()
                 .map(|v| v == "1")
                 .unwrap_or(s.notifications_enabled),
+            hide_nsfw: db
+                .get_setting("hide_nsfw")
+                .ok()
+                .flatten()
+                .map(|v| v == "1")
+                .unwrap_or(s.hide_nsfw),
+            ui_scale: db
+                .get_setting("ui_scale")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse().ok())
+                .map(|v: f32| v.clamp(0.8, 1.8))
+                .unwrap_or(s.ui_scale),
+            uniquestream_enabled: db
+                .get_setting("uniquestream_enabled")
+                .ok()
+                .flatten()
+                .map(|v| v == "1")
+                .unwrap_or(s.uniquestream_enabled),
             sidecar_warmup: db
                 .get_setting("sidecar_warmup")
                 .ok()
@@ -292,6 +336,12 @@ impl AppSettings {
             "notifications_enabled",
             if self.notifications_enabled { "1" } else { "0" },
         );
+        let _ = db.set_setting("hide_nsfw", if self.hide_nsfw { "1" } else { "0" });
+        let _ = db.set_setting("ui_scale", &self.ui_scale.to_string());
+        let _ = db.set_setting(
+            "uniquestream_enabled",
+            if self.uniquestream_enabled { "1" } else { "0" },
+        );
         let _ = db.set_setting(
             "sidecar_warmup",
             if self.sidecar_warmup { "1" } else { "0" },
@@ -350,6 +400,9 @@ pub struct AnimeDisplay {
     pub us_loaded_episodes: bool,
     pub va_slug: Option<String>,
     pub va_loaded_episodes: bool,
+    pub as_slug: Option<String>,
+    pub as_loaded_episodes: bool,
+    pub added_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +410,7 @@ pub enum AnimeSource {
     Franime,
     Uniquestream,
     Voiranime,
+    Animesama,
 }
 
 impl AnimeDisplay {
@@ -381,7 +435,32 @@ impl AnimeDisplay {
             us_loaded_episodes: false,
             va_slug: None,
             va_loaded_episodes: false,
+            as_slug: None,
+            as_loaded_episodes: false,
+            added_at: 0,
         }
+    }
+
+    fn from_as(series: &animesama::AsSeries) -> Self {
+        let id = animesama::as_id_from(&series.slug);
+        let mut a = Root2::default();
+        a.id = id;
+        a.title = series.title.clone();
+        a.title_o = String::new();
+        a.affiche = series.image.clone().unwrap_or_default();
+        a.affiche_small = series.image.clone();
+        a.description = String::new();
+        a.note = String::new();
+        a.start_date = String::new();
+        a.status = String::new();
+        a.nsfw = false;
+        a.source_url = series.url.clone();
+        a.themes = Vec::new();
+        a.saisons = Vec::new();
+        let mut d = AnimeDisplay::new(a);
+        d.source = AnimeSource::Animesama;
+        d.as_slug = Some(series.slug.clone());
+        d
     }
 
     fn from_va(series: &voiranime::VaSeries) -> Self {
@@ -434,8 +513,8 @@ impl AnimeDisplay {
         a.themes = Vec::new();
         a.saisons = Vec::new();
         let mut d = AnimeDisplay::new(a);
-        d.has_vo = series.subbed;
-        d.has_vf = series.dubbed;
+        d.has_vo = series.subbed || series.dubbed;
+        d.has_vf = false;
         d.source = AnimeSource::Uniquestream;
         d.us_content_id = Some(series.content_id.clone());
         d
@@ -625,12 +704,34 @@ impl Database {
             "ALTER TABLE voiranime_animes ADD COLUMN deep_done_at INTEGER",
             [],
         );
+        let _ = self.conn.execute(
+            "ALTER TABLE voiranime_animes ADD COLUMN sitemap_lastmod TEXT",
+            [],
+        );
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_va_title ON voiranime_animes(title)",
             [],
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_va_deep ON voiranime_animes(deep_done_at)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS animesama_animes (
+                slug TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                image TEXT,
+                json_data TEXT NOT NULL,
+                episodes_json TEXT,
+                deep_done_at INTEGER,
+                sitemap_lastmod TEXT,
+                added_at INTEGER DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_as_deep ON animesama_animes(deep_done_at)",
             [],
         )?;
 
@@ -1017,6 +1118,187 @@ impl Database {
         Ok(n)
     }
 
+    fn get_va_anime_lastmods(
+        &self,
+    ) -> Result<HashMap<String, (Option<String>, bool)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT slug, sitemap_lastmod, deep_done_at FROM voiranime_animes",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let slug: String = row.get(0)?;
+            let lastmod: Option<String> = row.get(1)?;
+            let deep_done_at: Option<i64> = row.get(2)?;
+            Ok((slug, (lastmod, deep_done_at.is_some())))
+        })?;
+        let mut out = HashMap::new();
+        for r in rows.flatten() {
+            out.insert(r.0, r.1);
+        }
+        Ok(out)
+    }
+
+    fn upsert_va_slug(
+        &self,
+        slug: &str,
+        url: &str,
+        lastmod: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let series_json = serde_json::json!({
+            "slug": slug,
+            "title": "",
+            "url": url,
+            "image": serde_json::Value::Null,
+        })
+        .to_string();
+        self.conn.execute(
+            "INSERT INTO voiranime_animes (slug, title, image, json_data, sitemap_lastmod, deep_done_at)
+             VALUES (?1, '', NULL, ?2, ?3, NULL)
+             ON CONFLICT(slug) DO UPDATE SET
+                sitemap_lastmod = ?3,
+                deep_done_at = NULL,
+                updated_at = strftime('%s', 'now')",
+            params![slug, series_json, lastmod],
+        )?;
+        Ok(())
+    }
+
+    fn set_va_anime_lastmod(&self, slug: &str, lastmod: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE voiranime_animes SET sitemap_lastmod = ?1 WHERE slug = ?2",
+            params![lastmod, slug],
+        )?;
+        Ok(())
+    }
+
+    fn franime_recency(&self) -> Result<HashMap<u64, i64>, rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, COALESCE(updated_at, created_at, 0) FROM animes")?;
+        let rows = stmt.query_map([], |row| {
+            let id: f64 = row.get(0)?;
+            let ts: i64 = row.get(1)?;
+            Ok((id.to_bits(), ts))
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    fn us_recency(&self) -> Result<HashMap<String, i64>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content_id, COALESCE(updated_at, added_at, 0) FROM uniquestream_animes",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    fn va_recency(&self) -> Result<HashMap<String, i64>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT slug, COALESCE(updated_at, added_at, 0) FROM voiranime_animes",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    fn as_recency(&self) -> Result<HashMap<String, i64>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT slug, COALESCE(updated_at, added_at, 0) FROM animesama_animes",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    fn save_as_episodes(&self, slug: &str, episodes_json: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE animesama_animes SET episodes_json = ?1, updated_at = strftime('%s', 'now') WHERE slug = ?2",
+            params![episodes_json, slug],
+        )?;
+        Ok(())
+    }
+
+    fn load_as_animes(&self) -> Result<Vec<AsStoredAnime>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT slug, json_data, episodes_json FROM animesama_animes ORDER BY title",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AsStoredAnime {
+                slug: row.get(0)?,
+                json_data: row.get(1)?,
+                episodes_json: row.get(2)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    fn load_as_animes_pending_deep(&self) -> Result<Vec<AsStoredAnime>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT slug, json_data, episodes_json FROM animesama_animes WHERE deep_done_at IS NULL ORDER BY title",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AsStoredAnime {
+                slug: row.get(0)?,
+                json_data: row.get(1)?,
+                episodes_json: row.get(2)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    fn mark_as_deep_done(&self, slug: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE animesama_animes SET deep_done_at = strftime('%s', 'now'), updated_at = strftime('%s', 'now') WHERE slug = ?1",
+            params![slug],
+        )?;
+        Ok(())
+    }
+
+    fn get_as_anime_lastmods(
+        &self,
+    ) -> Result<HashMap<String, (Option<String>, bool)>, rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT slug, sitemap_lastmod, deep_done_at FROM animesama_animes")?;
+        let rows = stmt.query_map([], |row| {
+            let slug: String = row.get(0)?;
+            let lastmod: Option<String> = row.get(1)?;
+            let deep_done_at: Option<i64> = row.get(2)?;
+            Ok((slug, (lastmod, deep_done_at.is_some())))
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    fn upsert_as_slug(&self, slug: &str, url: &str, lastmod: &str) -> Result<(), rusqlite::Error> {
+        let series_json = serde_json::json!({
+            "slug": slug,
+            "title": "",
+            "url": url,
+            "image": serde_json::Value::Null,
+        })
+        .to_string();
+        self.conn.execute(
+            "INSERT INTO animesama_animes (slug, title, image, json_data, sitemap_lastmod, deep_done_at)
+             VALUES (?1, '', NULL, ?2, ?3, NULL)
+             ON CONFLICT(slug) DO UPDATE SET
+                sitemap_lastmod = ?3,
+                deep_done_at = NULL,
+                updated_at = strftime('%s', 'now')",
+            params![slug, series_json, lastmod],
+        )?;
+        Ok(())
+    }
+
+    fn set_as_anime_lastmod(&self, slug: &str, lastmod: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE animesama_animes SET sitemap_lastmod = ?1 WHERE slug = ?2",
+            params![lastmod, slug],
+        )?;
+        Ok(())
+    }
+
     fn load_va_animes(&self) -> Result<Vec<VaStoredAnime>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT slug, json_data, episodes_json FROM voiranime_animes ORDER BY title",
@@ -1271,6 +1553,12 @@ pub struct AnimeDownloaderApp {
     va_loading: Arc<StdMutex<std::collections::HashSet<String>>>,
     va_episode_urls: Arc<StdMutex<HashMap<(u64, usize, usize), String>>>,
     va_episode_sources: Arc<StdMutex<HashMap<(u64, usize, usize), Vec<voiranime::VaSource>>>>,
+    as_load_tx: std::sync::mpsc::Sender<AsLoadResult>,
+    as_load_rx: std::sync::mpsc::Receiver<AsLoadResult>,
+    as_loading: Arc<StdMutex<std::collections::HashSet<String>>>,
+    as_episode_sources: Arc<
+        StdMutex<HashMap<(u64, usize, usize), (Vec<animesama::AsSource>, Vec<animesama::AsSource>)>>,
+    >,
     us_loading: Arc<StdMutex<std::collections::HashSet<String>>>,
     us_episode_ids: Arc<StdMutex<HashMap<(u64, usize, usize), String>>>,
     us_audio_locales: Arc<StdMutex<HashMap<u64, Vec<String>>>>,
@@ -1279,13 +1567,25 @@ pub struct AnimeDownloaderApp {
     theme_filter_mode: ThemeFilterMode,
     min_user_rating: f32,
     only_downloaded: bool,
-    hide_nsfw: bool,
     selected_statuses: std::collections::HashSet<UserStatus>,
     selected_user_tags: std::collections::BTreeSet<String>,
     all_themes_cache: Vec<String>,
     all_user_tags_cache: Vec<String>,
+    theme_search: String,
     sort_mode: SortMode,
     sort_descending: bool,
+    notif_tx: std::sync::mpsc::Sender<Toast>,
+    notif_rx: std::sync::mpsc::Receiver<Toast>,
+    toasts: Vec<Toast>,
+    selected_anime: Option<usize>,
+    nav_collapsed: bool,
+    member_to_rep: HashMap<usize, usize>,
+    rep_members: HashMap<usize, Vec<usize>>,
+    downloaded_eps: HashMap<u64, Vec<(usize, usize, String)>>,
+    recommended: Vec<usize>,
+    new_ep_alerts: Vec<(usize, usize, &'static str)>,
+    malist_status_filter: Option<UserStatus>,
+    malist_add_query: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1297,6 +1597,7 @@ enum ThemeFilterMode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SortMode {
     TitleAlpha,
+    RecentlyAdded,
     StartDate,
     UserRating,
     SiteRating,
@@ -1308,6 +1609,7 @@ impl SortMode {
     fn label(self) -> &'static str {
         match self {
             Self::TitleAlpha => "Titre",
+            Self::RecentlyAdded => "Derniers ajouts",
             Self::StartDate => "Date sortie",
             Self::UserRating => "Ma note",
             Self::SiteRating => "Note site",
@@ -1315,9 +1617,10 @@ impl SortMode {
             Self::SeasonsCount => "Nb saisons",
         }
     }
-    fn all() -> [Self; 6] {
+    fn all() -> [Self; 7] {
         [
             Self::TitleAlpha,
+            Self::RecentlyAdded,
             Self::StartDate,
             Self::UserRating,
             Self::SiteRating,
@@ -1346,6 +1649,13 @@ struct VaLoadResult {
     cached: Result<voiranime::VaCachedEpisodes, String>,
 }
 
+#[derive(Debug)]
+struct AsLoadResult {
+    slug: String,
+    anime_id_bits: u64,
+    cached: Result<animesama::AsCachedEpisodes, String>,
+}
+
 #[derive(Debug, Clone)]
 struct OriginalRequest {
     anime: Root2,
@@ -1353,6 +1663,65 @@ struct OriginalRequest {
     ep_idx: usize,
     lang: &'static str,
     lecteurs_to_try: Vec<u64>,
+    cross_attempts: Vec<SourceAttempt>,
+}
+
+#[derive(Debug, Clone)]
+enum SourceAttempt {
+    Franime {
+        anime_id: u64,
+        season_idx: usize,
+        ep_idx: usize,
+        lecteurs: Vec<u64>,
+        host_names: HashMap<u64, String>,
+    },
+    Voiranime {
+        ep_url: Option<String>,
+        sources: Vec<voiranime::VaSource>,
+        order: Vec<u64>,
+    },
+    Uniquestream {
+        ep_cid: String,
+        audio_locales: Vec<String>,
+        is_movie: bool,
+    },
+    Animesama {
+        sources: Vec<animesama::AsSource>,
+        order: Vec<u64>,
+    },
+}
+
+impl SourceAttempt {
+    fn source_label(&self) -> &'static str {
+        match self {
+            SourceAttempt::Franime { .. } => "franime",
+            SourceAttempt::Voiranime { .. } => "voiranime",
+            SourceAttempt::Uniquestream { .. } => "uniquestream",
+            SourceAttempt::Animesama { .. } => "anime-sama",
+        }
+    }
+}
+
+fn abs_episode_index(anime: &Root2, s: usize, e: usize) -> usize {
+    anime
+        .saisons
+        .iter()
+        .take(s)
+        .map(|x| x.episodes.len())
+        .sum::<usize>()
+        + e
+}
+
+fn locate_absolute_episode(anime: &Root2, abs: usize) -> Option<(usize, usize)> {
+    let mut acc = 0usize;
+    for (s_idx, s) in anime.saisons.iter().enumerate() {
+        let len = s.episodes.len();
+        if abs < acc + len {
+            return Some((s_idx, abs - acc));
+        }
+        acc += len;
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1378,6 +1747,60 @@ enum DownloadsFilter {
     Active,
     Failed,
     Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ToastKind {
+    Success,
+    Error,
+    Fallback,
+    Info,
+}
+
+impl ToastKind {
+    fn ttl(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            ToastKind::Error => 14,
+            ToastKind::Fallback => 8,
+            ToastKind::Success => 5,
+            ToastKind::Info => 4,
+        })
+    }
+    fn accent(self) -> Color32 {
+        match self {
+            ToastKind::Success => Color32::from_rgb(80, 250, 123),
+            ToastKind::Error => Color32::from_rgb(255, 85, 85),
+            ToastKind::Fallback => Color32::from_rgb(255, 184, 108),
+            ToastKind::Info => Color32::from_rgb(139, 233, 253),
+        }
+    }
+    fn glyph(self) -> &'static str {
+        match self {
+            ToastKind::Success => "OK",
+            ToastKind::Error => "!!",
+            ToastKind::Fallback => "->",
+            ToastKind::Info => "i",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Toast {
+    kind: ToastKind,
+    title: String,
+    body: String,
+    born: std::time::Instant,
+}
+
+impl Toast {
+    fn new(kind: ToastKind, title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            kind,
+            title: title.into(),
+            body: body.into(),
+            born: std::time::Instant::now(),
+        }
+    }
 }
 
 impl AnimeDownloaderApp {
@@ -1516,11 +1939,15 @@ impl AnimeDownloaderApp {
         let task_originals: Arc<StdMutex<HashMap<String, OriginalRequest>>> =
             Arc::new(StdMutex::new(HashMap::new()));
 
+        let (notif_tx, notif_rx) = std::sync::mpsc::channel::<Toast>();
+
         {
             let task_view = task_view.clone();
             let task_originals_ev = task_originals.clone();
             let db_ev = db.clone();
+            let notif_tx_ev = notif_tx.clone();
             runtime.spawn(async move {
+                let mut last_host: HashMap<String, String> = HashMap::new();
                 while let Some(event) = updates.recv().await {
                     let recorded_completion = matches!(&event,
                         DownloadEvent::Updated(t) if matches!(t.status, downloader::DownloadStatus::Completed));
@@ -1528,6 +1955,50 @@ impl AnimeDownloaderApp {
                         DownloadEvent::Updated(t) => Some(t.id.clone()),
                         _ => None,
                     };
+                    match &event {
+                        DownloadEvent::Updated(t) => {
+                            let fname = t
+                                .output_path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "fichier".to_string());
+                            match &t.status {
+                                downloader::DownloadStatus::Completed => {
+                                    let _ = notif_tx_ev.send(Toast::new(
+                                        ToastKind::Success,
+                                        "Téléchargement terminé",
+                                        fname,
+                                    ));
+                                    last_host.remove(&t.id);
+                                }
+                                downloader::DownloadStatus::Failed(msg) => {
+                                    let _ = notif_tx_ev.send(Toast::new(
+                                        ToastKind::Error,
+                                        "Échec téléchargement",
+                                        format!("{} — {}", fname, truncate_str(msg, 160)),
+                                    ));
+                                    last_host.remove(&t.id);
+                                }
+                                _ => {
+                                    if let Some(h) = &t.host {
+                                        if let Some(prev) = last_host.get(&t.id) {
+                                            if prev != h {
+                                                let _ = notif_tx_ev.send(Toast::new(
+                                                    ToastKind::Fallback,
+                                                    "Bascule de source",
+                                                    format!("{} → {}", fname, h),
+                                                ));
+                                            }
+                                        }
+                                        last_host.insert(t.id.clone(), h.clone());
+                                    }
+                                }
+                            }
+                        }
+                        DownloadEvent::Removed(id) => {
+                            last_host.remove(id);
+                        }
+                    }
                     {
                         let mut view = task_view.lock().unwrap();
                         match event {
@@ -1581,6 +2052,7 @@ impl AnimeDownloaderApp {
         let (sync_done_tx, sync_done_rx) = std::sync::mpsc::channel();
         let (us_load_tx, us_load_rx) = std::sync::mpsc::channel::<UsLoadResult>();
         let (va_load_tx, va_load_rx) = std::sync::mpsc::channel::<VaLoadResult>();
+        let (as_load_tx, as_load_rx) = std::sync::mpsc::channel::<AsLoadResult>();
         let (image_load_tx, image_load_rx) =
             std::sync::mpsc::channel::<(String, Option<Vec<u8>>)>();
 
@@ -1626,6 +2098,10 @@ impl AnimeDownloaderApp {
             va_loading: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             va_episode_urls: Arc::new(StdMutex::new(HashMap::new())),
             va_episode_sources: Arc::new(StdMutex::new(HashMap::new())),
+            as_load_tx: as_load_tx.clone(),
+            as_load_rx,
+            as_loading: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            as_episode_sources: Arc::new(StdMutex::new(HashMap::new())),
             logs_filter_source: None,
             logs_filter_level: None,
             logs_filter_query: String::new(),
@@ -1634,16 +2110,44 @@ impl AnimeDownloaderApp {
             theme_filter_mode: ThemeFilterMode::Any,
             min_user_rating: 0.0,
             only_downloaded: false,
-            hide_nsfw: false,
             selected_statuses: std::collections::HashSet::new(),
             selected_user_tags: std::collections::BTreeSet::new(),
             all_themes_cache: Vec::new(),
             all_user_tags_cache: Vec::new(),
+            theme_search: String::new(),
             sort_mode: SortMode::TitleAlpha,
             sort_descending: false,
+            notif_tx,
+            notif_rx,
+            toasts: Vec::new(),
+            selected_anime: None,
+            nav_collapsed: false,
+            member_to_rep: HashMap::new(),
+            rep_members: HashMap::new(),
+            downloaded_eps: HashMap::new(),
+            recommended: Vec::new(),
+            new_ep_alerts: Vec::new(),
+            malist_status_filter: None,
+            malist_add_query: String::new(),
         };
         out.rebuild_themes_cache();
         out.rebuild_user_tags_cache();
+        out.rebuild_groups();
+        {
+            let db = out.db.clone();
+            let dl = out
+                .runtime
+                .block_on(async move { db.lock().await.download_history().unwrap_or_default() });
+            let mut map: HashMap<u64, Vec<(usize, usize, String)>> = HashMap::new();
+            for (anime_id, s, e, lang, _ts) in &dl {
+                map.entry(anime_id.to_bits())
+                    .or_default()
+                    .push((*s, *e, lang.clone()));
+            }
+            out.downloaded_eps = map;
+        }
+        out.rebuild_discovery();
+        out.filter_animes();
 
         if out.settings.sidecar_warmup {
             let manager = out.manager.clone();
@@ -1678,6 +2182,84 @@ impl AnimeDownloaderApp {
         self.all_themes_cache = set.into_iter().collect();
     }
 
+    fn rebuild_groups(&mut self) {
+        self.member_to_rep.clear();
+        self.rep_members.clear();
+
+        let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, a) in self.animes.iter().enumerate() {
+            let key = normalize_title(&a.anime.title);
+            if key.is_empty() {
+                buckets.entry(format!("__solo_{}", i)).or_default().push(i);
+            } else {
+                buckets.entry(key).or_default().push(i);
+            }
+        }
+
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (_, idxs) in buckets {
+            if idxs.len() == 1 {
+                groups.push(idxs);
+                continue;
+            }
+            let mut known: Vec<(usize, i32)> = Vec::new();
+            let mut unknown: Vec<usize> = Vec::new();
+            for &i in &idxs {
+                match extract_year(&self.animes[i].anime.start_date) {
+                    Some(y) => known.push((i, y)),
+                    None => unknown.push(i),
+                }
+            }
+            known.sort_by_key(|(_, y)| *y);
+            let mut clusters: Vec<Vec<usize>> = Vec::new();
+            let mut cur: Vec<usize> = Vec::new();
+            let mut last_y: Option<i32> = None;
+            for (i, y) in &known {
+                if let Some(ly) = last_y {
+                    if (y - ly).abs() > 1 {
+                        clusters.push(std::mem::take(&mut cur));
+                    }
+                }
+                cur.push(*i);
+                last_y = Some(*y);
+            }
+            if !cur.is_empty() {
+                clusters.push(cur);
+            }
+            match clusters.len() {
+                0 => groups.push(unknown),
+                1 => {
+                    let mut g = clusters.pop().unwrap();
+                    g.extend(unknown);
+                    groups.push(g);
+                }
+                _ => {
+                    for c in clusters {
+                        groups.push(c);
+                    }
+                    for u in unknown {
+                        groups.push(vec![u]);
+                    }
+                }
+            }
+        }
+
+        for mut g in groups {
+            g.sort_by(|&a, &b| {
+                let pa = source_priority(self.animes[a].source);
+                let pb = source_priority(self.animes[b].source);
+                pb.cmp(&pa)
+                    .then(self.animes[b].total_episodes().cmp(&self.animes[a].total_episodes()))
+                    .then(a.cmp(&b))
+            });
+            let rep = g[0];
+            for &m in &g {
+                self.member_to_rep.insert(m, rep);
+            }
+            self.rep_members.insert(rep, g);
+        }
+    }
+
     fn rebuild_user_tags_cache(&mut self) {
         let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for a in &self.animes {
@@ -1686,6 +2268,99 @@ impl AnimeDownloaderApp {
             }
         }
         self.all_user_tags_cache = set.into_iter().collect();
+    }
+
+    fn rebuild_discovery(&mut self) {
+        let hide_nsfw = self.settings.hide_nsfw;
+        let us_enabled = self.settings.uniquestream_enabled;
+
+        let mut weights: HashMap<String, f32> = HashMap::new();
+        for d in &self.animes {
+            let id = d.anime.id.to_bits();
+            let liked = self.downloaded_eps.contains_key(&id)
+                || d.user_rating.map(|r| r >= 7.0).unwrap_or(false)
+                || matches!(
+                    d.user_status,
+                    Some(UserStatus::EnCours) | Some(UserStatus::Termine) | Some(UserStatus::AVoir)
+                );
+            if liked {
+                for t in &d.anime.themes {
+                    *weights.entry(t.clone()).or_insert(0.0) += 1.0;
+                }
+            }
+        }
+
+        let mut scored: Vec<(usize, f32)> = Vec::new();
+        if !weights.is_empty() {
+            for (idx, d) in self.animes.iter().enumerate() {
+                let id = d.anime.id.to_bits();
+                if self.downloaded_eps.contains_key(&id)
+                    || d.user_status == Some(UserStatus::Abandonne)
+                    || (hide_nsfw && d.anime.nsfw)
+                    || (!us_enabled && d.source == AnimeSource::Uniquestream)
+                    || d.anime.themes.is_empty()
+                {
+                    continue;
+                }
+                let mut score: f32 = d.anime.themes.iter().map(|t| weights.get(t).copied().unwrap_or(0.0)).sum();
+                if score <= 0.0 {
+                    continue;
+                }
+                let rating: f32 = d.anime.note.parse().unwrap_or(0.0);
+                score += rating * 0.1;
+                scored.push((idx, score));
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut recommended = Vec::new();
+        for (idx, _) in scored {
+            let rep = *self.member_to_rep.get(&idx).unwrap_or(&idx);
+            if !seen.insert(rep) {
+                continue;
+            }
+            recommended.push(idx);
+            if recommended.len() >= 18 {
+                break;
+            }
+        }
+        self.recommended = recommended;
+
+        let mut alerts: Vec<(usize, usize, &'static str)> = Vec::new();
+        for (idx, d) in self.animes.iter().enumerate() {
+            if d.user_status == Some(UserStatus::Abandonne) {
+                continue;
+            }
+            let id = d.anime.id.to_bits();
+            let Some(dls) = self.downloaded_eps.get(&id) else {
+                continue;
+            };
+            if dls.is_empty() {
+                continue;
+            }
+            let dl_max = dls
+                .iter()
+                .map(|(s, e, _)| abs_episode_index(&d.anime, *s, *e))
+                .max()
+                .unwrap_or(0);
+            let avail = d.total_episodes();
+            if avail == 0 {
+                continue;
+            }
+            let avail_max = avail - 1;
+            if avail_max > dl_max {
+                let vf = dls.iter().filter(|(_, _, l)| l == "vf").count();
+                let lang = if vf * 2 > dls.len() { "vf" } else { "vo" };
+                alerts.push((idx, avail_max - dl_max, lang));
+            }
+        }
+        alerts.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut seen2: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        alerts.retain(|(idx, _, _)| {
+            let rep = *self.member_to_rep.get(idx).unwrap_or(idx);
+            seen2.insert(rep)
+        });
+        self.new_ep_alerts = alerts;
     }
 
     fn sync_from_api(&mut self, ctx: egui::Context) {
@@ -1871,6 +2546,105 @@ impl AnimeDownloaderApp {
         }
     }
 
+    fn trigger_as_load(&self, anime_idx: usize) {
+        let display = &self.animes[anime_idx];
+        if display.source != AnimeSource::Animesama {
+            return;
+        }
+        if display.as_loaded_episodes && !display.anime.saisons.is_empty() {
+            return;
+        }
+        let Some(slug) = display.as_slug.clone() else {
+            return;
+        };
+        let anime_id_bits = display.anime.id.to_bits();
+        {
+            let mut loading = self.as_loading.lock().unwrap();
+            if loading.contains(&slug) {
+                return;
+            }
+            loading.insert(slug.clone());
+        }
+        let tx = self.as_load_tx.clone();
+        let db = self.db.clone();
+        applog::log_event(
+            applog::LogSource::App,
+            applog::LogLevel::Info,
+            format!("anime-sama load épisodes pour {}", slug),
+        );
+        self.runtime.spawn(async move {
+            let client = match animesama::AsClient::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(AsLoadResult {
+                        slug,
+                        anime_id_bits,
+                        cached: Err(format!("client: {}", e)),
+                    });
+                    return;
+                }
+            };
+            match client.anime_detail(&slug).await {
+                Ok(cached) => {
+                    if let Ok(json) = serde_json::to_string(&cached) {
+                        let guard = db.lock().await;
+                        let _ = guard.save_as_episodes(&slug, &json);
+                    }
+                    let _ = tx.send(AsLoadResult {
+                        slug,
+                        anime_id_bits,
+                        cached: Ok(cached),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AsLoadResult {
+                        slug,
+                        anime_id_bits,
+                        cached: Err(e.to_string()),
+                    });
+                }
+            }
+        });
+    }
+
+    fn drain_as_load_results(&mut self) {
+        while let Ok(result) = self.as_load_rx.try_recv() {
+            self.as_loading.lock().unwrap().remove(&result.slug);
+            let Some(idx) = self
+                .animes
+                .iter()
+                .position(|a| a.anime.id.to_bits() == result.anime_id_bits)
+            else {
+                continue;
+            };
+            match result.cached {
+                Ok(cached) => {
+                    apply_as_cached_to_anime(
+                        &mut self.animes[idx],
+                        &cached,
+                        &self.as_episode_sources,
+                    );
+                    applog::log_event(
+                        applog::LogSource::App,
+                        applog::LogLevel::Info,
+                        format!(
+                            "anime-sama {} chargé : {} saison(s)",
+                            result.slug,
+                            cached.seasons.len()
+                        ),
+                    );
+                }
+                Err(e) => {
+                    applog::log_event(
+                        applog::LogSource::App,
+                        applog::LogLevel::Error,
+                        format!("anime-sama load {} KO: {}", result.slug, e),
+                    );
+                }
+            }
+        }
+    }
+
     fn backfill_images(&mut self, ctx: egui::Context) {
         if self.is_syncing.swap(true, Ordering::SeqCst) {
             return;
@@ -1899,6 +2673,40 @@ impl AnimeDownloaderApp {
         let is_syncing = self.is_syncing.clone();
         self.runtime.spawn(async move {
             let outcome = run_va_sync(db).await;
+            is_syncing.store(false, Ordering::SeqCst);
+            let _ = tx.send(outcome);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn refresh_voiranime(&mut self, ctx: egui::Context) {
+        if self.is_syncing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.sync_status = "Rafraîchissement voiranime (sitemap)…".to_string();
+        let db = Arc::clone(&self.db);
+        let tx = self.sync_done_tx.clone();
+        let ctx_clone = ctx.clone();
+        let is_syncing = self.is_syncing.clone();
+        self.runtime.spawn(async move {
+            let outcome = run_va_refresh(db).await;
+            is_syncing.store(false, Ordering::SeqCst);
+            let _ = tx.send(outcome);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn sync_animesama(&mut self, ctx: egui::Context) {
+        if self.is_syncing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.sync_status = "Sync anime-sama (sitemap)…".to_string();
+        let db = Arc::clone(&self.db);
+        let tx = self.sync_done_tx.clone();
+        let ctx_clone = ctx.clone();
+        let is_syncing = self.is_syncing.clone();
+        self.runtime.spawn(async move {
+            let outcome = run_as_sync(db).await;
             is_syncing.store(false, Ordering::SeqCst);
             let _ = tx.send(outcome);
             ctx_clone.request_repaint();
@@ -1982,19 +2790,47 @@ impl AnimeDownloaderApp {
 
     fn reload_from_db(&mut self) {
         let db = self.db.clone();
-        let (loaded_animes, notes, downloaded, watched, tags, us_rows, va_rows) =
-            self.runtime.block_on(async move {
-                let guard = db.lock().await;
-                (
-                    guard.load_animes().unwrap_or_default(),
-                    guard.load_user_notes().unwrap_or_default(),
-                    guard.downloaded_anime_ids().unwrap_or_default(),
-                    guard.load_watched().unwrap_or_default(),
-                    guard.load_tags().unwrap_or_default(),
-                    guard.load_us_animes().unwrap_or_default(),
-                    guard.load_va_animes().unwrap_or_default(),
-                )
-            });
+        let (
+            loaded_animes,
+            notes,
+            downloaded,
+            watched,
+            tags,
+            us_rows,
+            va_rows,
+            as_rows,
+            fr_recency,
+            us_recency,
+            va_recency,
+            as_recency,
+            dl_history,
+        ) = self.runtime.block_on(async move {
+            let guard = db.lock().await;
+            (
+                guard.load_animes().unwrap_or_default(),
+                guard.load_user_notes().unwrap_or_default(),
+                guard.downloaded_anime_ids().unwrap_or_default(),
+                guard.load_watched().unwrap_or_default(),
+                guard.load_tags().unwrap_or_default(),
+                guard.load_us_animes().unwrap_or_default(),
+                guard.load_va_animes().unwrap_or_default(),
+                guard.load_as_animes().unwrap_or_default(),
+                guard.franime_recency().unwrap_or_default(),
+                guard.us_recency().unwrap_or_default(),
+                guard.va_recency().unwrap_or_default(),
+                guard.as_recency().unwrap_or_default(),
+                guard.download_history().unwrap_or_default(),
+            )
+        });
+
+        let mut downloaded_eps: HashMap<u64, Vec<(usize, usize, String)>> = HashMap::new();
+        for (anime_id, s, e, lang, _ts) in &dl_history {
+            downloaded_eps
+                .entry(anime_id.to_bits())
+                .or_default()
+                .push((*s, *e, lang.clone()));
+        }
+        self.downloaded_eps = downloaded_eps;
 
         let prev_expanded: HashMap<u64, bool> = self
             .animes
@@ -2046,6 +2882,19 @@ impl AnimeDownloaderApp {
                 if let Some(t) = tags.get(&id_bits) {
                     d.user_tags = t.clone();
                 }
+                if let Some(eps_json) = &row.episodes_json {
+                    if let Ok(cached) =
+                        serde_json::from_str::<uniquestream::UsCachedEpisodes>(eps_json)
+                    {
+                        apply_us_cached_to_anime(
+                            &mut d,
+                            &cached,
+                            &self.us_episode_ids,
+                            &self.us_audio_locales,
+                            &self.us_movies,
+                        );
+                    }
+                }
                 merged.push(d);
             }
         }
@@ -2083,11 +2932,71 @@ impl AnimeDownloaderApp {
                 merged.push(d);
             }
         }
+        for row in &as_rows {
+            let Some(eps_json) = &row.episodes_json else {
+                continue;
+            };
+            let Ok(cached) = serde_json::from_str::<animesama::AsCachedEpisodes>(eps_json) else {
+                continue;
+            };
+            if cached.seasons.is_empty() {
+                continue;
+            }
+            let Ok(series) = serde_json::from_str::<animesama::AsSeries>(&row.json_data) else {
+                continue;
+            };
+            let mut d = AnimeDisplay::from_as(&series);
+            let id_bits = d.anime.id.to_bits();
+            if let Some(&expanded) = prev_expanded.get(&id_bits) {
+                d.expanded = expanded;
+            }
+            if let Some(n) = notes.get(&id_bits) {
+                d.user_rating = n.rating;
+                d.user_comment = n.comment.clone().unwrap_or_default();
+                d.user_status = n.status.as_deref().and_then(UserStatus::from_db_key);
+            }
+            d.is_downloaded = downloaded.contains(&id_bits);
+            if let Some(set) = watched.get(&id_bits) {
+                d.watched_eps = set.clone();
+            }
+            if let Some(t) = tags.get(&id_bits) {
+                d.user_tags = t.clone();
+            }
+            apply_as_cached_to_anime(&mut d, &cached, &self.as_episode_sources);
+            merged.push(d);
+        }
+        for d in &mut merged {
+            d.added_at = match d.source {
+                AnimeSource::Franime => {
+                    fr_recency.get(&d.anime.id.to_bits()).copied().unwrap_or(0)
+                }
+                AnimeSource::Uniquestream => d
+                    .us_content_id
+                    .as_ref()
+                    .and_then(|c| us_recency.get(c))
+                    .copied()
+                    .unwrap_or(0),
+                AnimeSource::Voiranime => d
+                    .va_slug
+                    .as_ref()
+                    .and_then(|s| va_recency.get(s))
+                    .copied()
+                    .unwrap_or(0),
+                AnimeSource::Animesama => d
+                    .as_slug
+                    .as_ref()
+                    .and_then(|s| as_recency.get(s))
+                    .copied()
+                    .unwrap_or(0),
+            };
+        }
         merged.sort_by(|a, b| a.anime.title.to_lowercase().cmp(&b.anime.title.to_lowercase()));
         self.animes = merged;
 
         self.rebuild_themes_cache();
         self.rebuild_user_tags_cache();
+        self.rebuild_groups();
+        self.rebuild_discovery();
         self.filter_animes();
     }
 
@@ -2225,6 +3134,94 @@ impl AnimeDownloaderApp {
         }
     }
 
+    fn push_toast(&self, kind: ToastKind, title: impl Into<String>, body: impl Into<String>) {
+        let _ = self.notif_tx.send(Toast::new(kind, title, body));
+    }
+
+    fn drain_notifications(&mut self) {
+        while let Ok(toast) = self.notif_rx.try_recv() {
+            if self.settings.notifications_enabled {
+                self.toasts.push(toast);
+            }
+        }
+        let now = std::time::Instant::now();
+        self.toasts
+            .retain(|t| now.duration_since(t.born) < t.kind.ttl());
+        if self.toasts.len() > 6 {
+            let drop = self.toasts.len() - 6;
+            self.toasts.drain(0..drop);
+        }
+    }
+
+    fn render_toasts(&mut self, ctx: &egui::Context) {
+        if self.toasts.is_empty() {
+            return;
+        }
+        let toasts = self.toasts.clone();
+        let mut dismiss: Option<usize> = None;
+        egui::Area::new(egui::Id::new("toasts_overlay"))
+            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 16.0))
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.set_max_width(360.0);
+                for (idx, toast) in toasts.iter().enumerate().rev() {
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(38, 40, 52))
+                        .stroke(egui::Stroke::new(1.5_f32, toast.kind.accent()))
+                        .corner_radius(8.0)
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.set_width(320.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(toast.kind.glyph())
+                                        .size(12.0)
+                                        .strong()
+                                        .color(toast.kind.accent()),
+                                );
+                                ui.label(
+                                    RichText::new(&toast.title)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("×")
+                                                        .size(13.0)
+                                                        .color(Color32::from_rgb(180, 180, 190)),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .clicked()
+                                        {
+                                            dismiss = Some(idx);
+                                        }
+                                    },
+                                );
+                            });
+                            ui.label(
+                                RichText::new(&toast.body)
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(205, 205, 215)),
+                            );
+                        });
+                    ui.add_space(8.0);
+                }
+            });
+        if let Some(idx) = dismiss {
+            if idx < self.toasts.len() {
+                self.toasts.remove(idx);
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+
     fn levenshtein_distance(s1: &str, s2: &str) -> usize {
         let len1 = s1.chars().count();
         let len2 = s2.chars().count();
@@ -2329,7 +3326,8 @@ impl AnimeDownloaderApp {
         let query_lower = self.search_query.to_lowercase();
         let min_rating = self.min_user_rating;
         let only_dl = self.only_downloaded;
-        let hide_nsfw = self.hide_nsfw;
+        let hide_nsfw = self.settings.hide_nsfw;
+        let us_enabled = self.settings.uniquestream_enabled;
         let lang_filter = self.lang_filter.clone();
         let statuses = self.selected_statuses.clone();
         let req_tags = self.selected_user_tags.clone();
@@ -2356,6 +3354,7 @@ impl AnimeDownloaderApp {
                     || anime.user_rating.map(|r| r >= min_rating).unwrap_or(false);
                 let dl_ok = !only_dl || anime.is_downloaded;
                 let nsfw_ok = !hide_nsfw || !anime.anime.nsfw;
+                let source_ok = us_enabled || anime.source != AnimeSource::Uniquestream;
                 let theme_ok = *theme_ok.get(idx).unwrap_or(&true);
                 let status_ok = statuses.is_empty()
                     || anime.user_status.map(|s| statuses.contains(&s)).unwrap_or(false);
@@ -2365,6 +3364,7 @@ impl AnimeDownloaderApp {
                     && rating_ok
                     && dl_ok
                     && nsfw_ok
+                    && source_ok
                     && theme_ok
                     && status_ok
                     && tag_ok
@@ -2373,6 +3373,25 @@ impl AnimeDownloaderApp {
             .map(|(idx, _)| idx)
             .collect();
 
+        if !self.member_to_rep.is_empty() {
+            let passing: std::collections::HashSet<usize> = indices.iter().copied().collect();
+            let mut shown: Vec<usize> = Vec::with_capacity(indices.len());
+            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for &i in &indices {
+                let rep = *self.member_to_rep.get(&i).unwrap_or(&i);
+                if !seen.insert(rep) {
+                    continue;
+                }
+                let shown_idx = self
+                    .rep_members
+                    .get(&rep)
+                    .and_then(|ms| ms.iter().copied().find(|m| passing.contains(m)))
+                    .unwrap_or(i);
+                shown.push(shown_idx);
+            }
+            indices = shown;
+        }
+
         let sort_mode = self.sort_mode;
         let desc = self.sort_descending;
         indices.sort_by(|&a, &b| {
@@ -2380,6 +3399,7 @@ impl AnimeDownloaderApp {
             let bb = &self.animes[b];
             let ord = match sort_mode {
                 SortMode::TitleAlpha => aa.anime.title.to_lowercase().cmp(&bb.anime.title.to_lowercase()),
+                SortMode::RecentlyAdded => aa.added_at.cmp(&bb.added_at),
                 SortMode::StartDate => aa.anime.start_date.cmp(&bb.anime.start_date),
                 SortMode::UserRating => {
                     let ax = aa.user_rating.unwrap_or(-1.0);
@@ -2523,6 +3543,7 @@ impl AnimeDownloaderApp {
             return;
         }
 
+        let cross_attempts = original.cross_attempts.clone();
         let fetcher = self.fetcher.clone();
         let manager = self.manager.clone();
         let originals = self.task_originals.clone();
@@ -2595,6 +3616,27 @@ impl AnimeDownloaderApp {
             .cloned()
             .unwrap_or_default();
 
+        let as_ep_sources: Vec<animesama::AsSource> = {
+            let pair = self
+                .as_episode_sources
+                .lock()
+                .unwrap()
+                .get(&(anime.id.to_bits(), original.season_idx, original.ep_idx))
+                .cloned();
+            match pair {
+                Some((vo, vf)) => {
+                    if lang == "vf" && !vf.is_empty() {
+                        vf
+                    } else if !vo.is_empty() {
+                        vo
+                    } else {
+                        vf
+                    }
+                }
+                None => Vec::new(),
+            }
+        };
+
         let consumet_url = self.settings.consumet_base_url.clone();
         let consumet_provider = self.settings.consumet_provider.clone();
         let consumet_enabled = self.settings.consumet_enabled;
@@ -2621,27 +3663,9 @@ impl AnimeDownloaderApp {
                 .unwrap()
                 .insert(task_id.clone(), original_for_map);
 
-            if source == AnimeSource::Voiranime && va_ep_url.is_none() {
-                manager
-                    .mark_failed(
-                        &task_id,
-                        "voiranime: épisodes pas encore chargés (déplie l'anime d'abord)".to_string(),
-                    )
-                    .await;
-                return;
-            }
-            if source == AnimeSource::Uniquestream && us_ep_id.is_none() {
-                manager
-                    .mark_failed(
-                        &task_id,
-                        "uniquestream: épisodes pas encore chargés (déplie l'anime d'abord)".to_string(),
-                    )
-                    .await;
-                return;
-            }
+            let mut attempts: Vec<(String, String)> = Vec::new();
 
             if source == AnimeSource::Voiranime {
-                let mut va_attempts: Vec<(String, String)> = Vec::new();
                 if !va_ep_sources.is_empty() {
                     for lecteur_idx in &lecteurs {
                         let i = *lecteur_idx as usize;
@@ -2661,7 +3685,11 @@ impl AnimeDownloaderApp {
                             ),
                         );
                         match manager
-                            .extract_and_download(task_id.clone(), src.iframe.clone())
+                            .extract_and_download_embed(
+                                task_id.clone(),
+                                src.iframe.clone(),
+                                "https://voir-anime.to/".to_string(),
+                            )
                             .await
                         {
                             Ok(()) => return,
@@ -2671,22 +3699,14 @@ impl AnimeDownloaderApp {
                                     applog::LogLevel::Warn,
                                     format!("voiranime {} KO: {}", src.host, e),
                                 );
-                                va_attempts.push((src.host.clone(), format!("{}", e)));
+                                attempts.push((
+                                    format!("voiranime:{}", src.host),
+                                    format!("{}", e),
+                                ));
                                 continue;
                             }
                         }
                     }
-                    let summary = if va_attempts.is_empty() {
-                        "voiranime: aucune source utilisable".to_string()
-                    } else {
-                        let parts: Vec<String> = va_attempts
-                            .iter()
-                            .map(|(h, e)| format!("{}: {}", h, e))
-                            .collect();
-                        format!("voiranime: tous lecteurs KO — {}", parts.join(" · "))
-                    };
-                    manager.mark_failed(&task_id, summary).await;
-                    return;
                 } else if let Some(ep_url) = va_ep_url.clone() {
                     applog::log_event(
                         applog::LogSource::App,
@@ -2709,41 +3729,81 @@ impl AnimeDownloaderApp {
                                     )
                                     .await;
                                 match manager
-                                    .extract_and_download(task_id.clone(), iframe)
+                                    .extract_and_download_embed(
+                                        task_id.clone(),
+                                        iframe,
+                                        "https://voir-anime.to/".to_string(),
+                                    )
                                     .await
                                 {
                                     Ok(()) => return,
-                                    Err(e) => {
-                                        manager
-                                            .mark_failed(
-                                                &task_id,
-                                                format!("voiranime DL: {}", e),
-                                            )
-                                            .await;
-                                        return;
-                                    }
+                                    Err(e) => attempts.push((
+                                        "voiranime".to_string(),
+                                        format!("DL: {}", e),
+                                    )),
                                 }
                             }
-                            Err(e) => {
-                                manager
-                                    .mark_failed(
-                                        &task_id,
-                                        format!("voiranime iframe: {}", e),
-                                    )
-                                    .await;
-                                return;
-                            }
+                            Err(e) => attempts.push((
+                                "voiranime".to_string(),
+                                format!("iframe: {}", e),
+                            )),
                         },
-                        Err(e) => {
-                            manager
-                                .mark_failed(
-                                    &task_id,
-                                    format!("voiranime client: {}", e),
-                                )
-                                .await;
-                            return;
+                        Err(e) => attempts.push((
+                            "voiranime".to_string(),
+                            format!("client: {}", e),
+                        )),
+                    }
+                } else {
+                    attempts.push((
+                        "voiranime".to_string(),
+                        "épisodes pas encore chargés (déplie l'anime d'abord)".to_string(),
+                    ));
+                }
+            }
+
+            if source == AnimeSource::Animesama {
+                if !as_ep_sources.is_empty() {
+                    for lecteur_idx in &lecteurs {
+                        let i = *lecteur_idx as usize;
+                        let Some(src) = as_ep_sources.get(i) else {
+                            continue;
+                        };
+                        manager
+                            .set_task_host(&task_id, Some(format!("anime-sama:{}", src.host)))
+                            .await;
+                        manager.add_attempted_lecteur(&task_id, *lecteur_idx).await;
+                        applog::log_event(
+                            applog::LogSource::App,
+                            applog::LogLevel::Info,
+                            format!(
+                                "anime-sama DL via {} → {}",
+                                src.host,
+                                &src.iframe[..src.iframe.len().min(120)]
+                            ),
+                        );
+                        match manager
+                            .extract_and_download_embed(
+                                task_id.clone(),
+                                src.iframe.clone(),
+                                "https://anime-sama.to/".to_string(),
+                            )
+                            .await
+                        {
+                            Ok(()) => return,
+                            Err(e) => {
+                                attempts.push((
+                                    format!("anime-sama:{}", src.host),
+                                    format!("{}", e),
+                                ));
+                                continue;
+                            }
                         }
                     }
+                } else {
+                    attempts.push((
+                        "anime-sama".to_string(),
+                        "épisodes pas encore chargés (déplie l'anime d'abord)".to_string(),
+                    ));
                 }
             }
 
@@ -2781,40 +3841,33 @@ impl AnimeDownloaderApp {
                             );
                             match manager.download_direct(task_id.clone(), url).await {
                                 Ok(()) => return,
-                                Err(e) => {
-                                    manager
-                                        .mark_failed(
-                                            &task_id,
-                                            format!("uniquestream DL: {}", e),
-                                        )
-                                        .await;
-                                    return;
-                                }
+                                Err(e) => attempts.push((
+                                    format!("uniquestream:{}", locale),
+                                    format!("{}", e),
+                                )),
                             }
                         }
-                        Err(e) => {
-                            manager
-                                .mark_failed(
-                                    &task_id,
-                                    format!("uniquestream media: {}", e),
-                                )
-                                .await;
-                            return;
-                        }
+                        Err(e) => attempts.push((
+                            "uniquestream".to_string(),
+                            format!("media: {}", e),
+                        )),
                     },
-                    Err(e) => {
-                        manager
-                            .mark_failed(
-                                &task_id,
-                                format!("uniquestream client: {}", e),
-                            )
-                            .await;
-                        return;
-                    }
+                    Err(e) => attempts.push((
+                        "uniquestream".to_string(),
+                        format!("client: {}", e),
+                    )),
                 }
+            } else if source == AnimeSource::Uniquestream {
+                attempts.push((
+                    "uniquestream".to_string(),
+                    "épisodes pas encore chargés (déplie l'anime d'abord)".to_string(),
+                ));
             }
 
-            let mut attempts: Vec<(String, String)> = Vec::new();
+            if source != AnimeSource::Voiranime
+                && source != AnimeSource::Uniquestream
+                && source != AnimeSource::Animesama
+            {
             for lecteur in &lecteurs {
                 let host_name = lecteur_names
                     .get(lecteur)
@@ -2856,15 +3909,30 @@ impl AnimeDownloaderApp {
                     }
                 }
             }
+            }
+
+            for ca in &cross_attempts {
+                applog::log_event(
+                    applog::LogSource::App,
+                    applog::LogLevel::Info,
+                    format!("fallback cross-source → {}", ca.source_label()),
+                );
+                match try_source_attempt(&manager, &fetcher, &task_id, ca, lang).await {
+                    Ok(()) => return,
+                    Err(e) => {
+                        attempts.push((format!("{}(alt)", ca.source_label()), e));
+                    }
+                }
+            }
 
             let summary = if attempts.is_empty() {
-                "Aucune tentative".to_string()
+                "Aucune tentative directe".to_string()
             } else {
                 let parts: Vec<String> = attempts
                     .iter()
                     .map(|(host, err)| format!("{}: {}", host, err))
                     .collect();
-                format!("Tous les lecteurs ont échoué — {}", parts.join(" · "))
+                format!("Sources directes KO — {}", parts.join(" · "))
             };
 
             if anikuro_enabled && anikuro_auto_fallback {
@@ -3054,19 +4122,222 @@ impl AnimeDownloaderApp {
                 }
                 ordered
             }
+        } else if source == AnimeSource::Animesama {
+            let pair = self
+                .as_episode_sources
+                .lock()
+                .unwrap()
+                .get(&(anime.id.to_bits(), season_idx, ep_idx))
+                .cloned();
+            let sources = match pair {
+                Some((vo, vf)) => {
+                    if lang == "vf" && !vf.is_empty() {
+                        vf
+                    } else if !vo.is_empty() {
+                        vo
+                    } else {
+                        vf
+                    }
+                }
+                None => Vec::new(),
+            };
+            if sources.is_empty() {
+                vec![0u64]
+            } else {
+                let mut ordered: Vec<u64> = Vec::new();
+                if let Some(host) = preferred_host {
+                    let host_lower = host.to_lowercase();
+                    for (i, s) in sources.iter().enumerate() {
+                        if s.host.to_lowercase().contains(&host_lower) {
+                            ordered.push(i as u64);
+                        }
+                    }
+                }
+                for i in 0..sources.len() {
+                    if !ordered.contains(&(i as u64)) {
+                        ordered.push(i as u64);
+                    }
+                }
+                ordered
+            }
         } else {
             vec![0u64]
         };
         if lecteurs_to_try.is_empty() {
             return;
         }
+        let cross_attempts =
+            self.build_cross_attempts(anime, season_idx, ep_idx, lang, preferred_host);
         self.spawn_episode_download(OriginalRequest {
             anime: anime.clone(),
             season_idx,
             ep_idx,
             lang,
             lecteurs_to_try,
+            cross_attempts,
         });
+    }
+
+    fn build_cross_attempts(
+        &self,
+        anime: &Root2,
+        season_idx: usize,
+        ep_idx: usize,
+        lang: &'static str,
+        preferred_host: Option<&str>,
+    ) -> Vec<SourceAttempt> {
+        let mut out = Vec::new();
+        let Some(pidx) = self.animes.iter().position(|d| d.anime.id == anime.id) else {
+            return out;
+        };
+        let rep = *self.member_to_rep.get(&pidx).unwrap_or(&pidx);
+        let Some(members) = self.rep_members.get(&rep) else {
+            return out;
+        };
+        if members.len() <= 1 {
+            return out;
+        }
+        let abs = anime
+            .saisons
+            .iter()
+            .take(season_idx)
+            .map(|s| s.episodes.len())
+            .sum::<usize>()
+            + ep_idx;
+        let us_enabled = self.settings.uniquestream_enabled;
+        let fallback = self.settings.preferred_lecteur_host.clone();
+        let effective_host: Option<&str> = preferred_host.or_else(|| {
+            if fallback.is_empty() {
+                None
+            } else {
+                Some(fallback.as_str())
+            }
+        });
+        for &m in members {
+            if m == pidx {
+                continue;
+            }
+            let md = &self.animes[m];
+            if !us_enabled && md.source == AnimeSource::Uniquestream {
+                continue;
+            }
+            let Some((s2, e2)) = locate_absolute_episode(&md.anime, abs) else {
+                continue;
+            };
+            let mid = md.anime.id.to_bits();
+            match md.source {
+                AnimeSource::Franime => {
+                    let lecteurs =
+                        Self::valid_lecteurs_for_host(&md.anime, s2, e2, lang, effective_host);
+                    if lecteurs.is_empty() {
+                        continue;
+                    }
+                    let names = md
+                        .anime
+                        .saisons
+                        .get(s2)
+                        .and_then(|s| s.episodes.get(e2))
+                        .map(|e| {
+                            if lang == "vf" {
+                                &e.lang.vf.lecteurs
+                            } else {
+                                &e.lang.vo.lecteurs
+                            }
+                        });
+                    let host_names: HashMap<u64, String> = names
+                        .map(|ns| {
+                            ns.iter()
+                                .enumerate()
+                                .map(|(i, n)| (i as u64, n.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    out.push(SourceAttempt::Franime {
+                        anime_id: md.anime.id as u64,
+                        season_idx: s2,
+                        ep_idx: e2,
+                        lecteurs,
+                        host_names,
+                    });
+                }
+                AnimeSource::Voiranime => {
+                    let sources = self
+                        .va_episode_sources
+                        .lock()
+                        .unwrap()
+                        .get(&(mid, s2, e2))
+                        .cloned()
+                        .unwrap_or_default();
+                    let ep_url = self
+                        .va_episode_urls
+                        .lock()
+                        .unwrap()
+                        .get(&(mid, s2, e2))
+                        .cloned();
+                    if sources.is_empty() && ep_url.is_none() {
+                        continue;
+                    }
+                    let order: Vec<u64> = (0..sources.len() as u64).collect();
+                    out.push(SourceAttempt::Voiranime {
+                        ep_url,
+                        sources,
+                        order,
+                    });
+                }
+                AnimeSource::Uniquestream => {
+                    let ep_cid = self
+                        .us_episode_ids
+                        .lock()
+                        .unwrap()
+                        .get(&(mid, s2, e2))
+                        .cloned();
+                    let Some(ep_cid) = ep_cid else {
+                        continue;
+                    };
+                    let audio_locales = self
+                        .us_audio_locales
+                        .lock()
+                        .unwrap()
+                        .get(&mid)
+                        .cloned()
+                        .unwrap_or_default();
+                    let is_movie = md
+                        .us_content_id
+                        .as_ref()
+                        .map(|c| self.us_movies.lock().unwrap().contains(c))
+                        .unwrap_or(false);
+                    out.push(SourceAttempt::Uniquestream {
+                        ep_cid,
+                        audio_locales,
+                        is_movie,
+                    });
+                }
+                AnimeSource::Animesama => {
+                    let pair = self
+                        .as_episode_sources
+                        .lock()
+                        .unwrap()
+                        .get(&(mid, s2, e2))
+                        .cloned();
+                    let Some((vo, vf)) = pair else {
+                        continue;
+                    };
+                    let sources = if lang == "vf" && !vf.is_empty() {
+                        vf
+                    } else if !vo.is_empty() {
+                        vo
+                    } else {
+                        vf
+                    };
+                    if sources.is_empty() {
+                        continue;
+                    }
+                    let order: Vec<u64> = (0..sources.len() as u64).collect();
+                    out.push(SourceAttempt::Animesama { sources, order });
+                }
+            }
+        }
+        out
     }
 
     fn enqueue_anime(
@@ -3129,6 +4400,18 @@ impl AnimeDownloaderApp {
         let id_owned = id.to_string();
         self.runtime.spawn(async move {
             manager.cancel(&id_owned).await;
+        });
+    }
+
+    fn cancel_tasks(&self, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        let manager = self.manager.clone();
+        self.runtime.spawn(async move {
+            for id in ids {
+                manager.cancel(&id).await;
+            }
         });
     }
 
@@ -3290,6 +4573,7 @@ impl AnimeDownloaderApp {
             ep_idx: original.ep_idx,
             lang: original.lang,
             lecteurs_to_try: remaining,
+            cross_attempts: original.cross_attempts,
         });
     }
 
@@ -3760,6 +5044,7 @@ impl AnimeDownloaderApp {
                                 AnimeSource::Franime => None,
                                 AnimeSource::Uniquestream => Some(("US", Color32::from_rgb(139, 233, 253))),
                                 AnimeSource::Voiranime => Some(("VA", Color32::from_rgb(255, 184, 108))),
+                                AnimeSource::Animesama => Some(("AS", Color32::from_rgb(241, 196, 64))),
                             };
                             if let Some((lbl, color)) = src_lbl {
                                 ui.add_space(6.0);
@@ -3857,15 +5142,15 @@ impl AnimeDownloaderApp {
                             ui.add_space(8.0);
                         }
 
-                        let description = truncate_str(
-                            &self.animes[anime_idx].anime.description,
-                            240,
-                        );
-                        ui.label(
-                            RichText::new(description)
-                                .size(13.0)
-                                .color(Color32::from_rgb(200, 200, 210)),
-                        );
+                        let description =
+                            self.animes[anime_idx].anime.description.clone();
+                        if !description.is_empty() {
+                            ui.label(
+                                RichText::new(description)
+                                    .size(13.0)
+                                    .color(Color32::from_rgb(200, 200, 210)),
+                            );
+                        }
 
                         ui.add_space(12.0);
 
@@ -4352,11 +5637,13 @@ impl AnimeDownloaderApp {
             if self.animes[anime_idx].expanded {
                 self.trigger_us_load(anime_idx);
                 self.trigger_va_load(anime_idx);
+                self.trigger_as_load(anime_idx);
             }
         }
         if !dl_actions.is_empty() || !ep_dl_actions.is_empty() {
             self.trigger_us_load(anime_idx);
             self.trigger_va_load(anime_idx);
+            self.trigger_as_load(anime_idx);
         }
 
         let anime_id_f64 = self.animes[anime_idx].anime.id;
@@ -4483,16 +5770,1166 @@ impl AnimeDownloaderApp {
             }
         }
     }
+
+    fn render_catalogue(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Some(sel) = self.selected_anime {
+            if sel >= self.animes.len() {
+                self.selected_anime = None;
+            } else {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("← Retour au catalogue")
+                                    .size(13.0)
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(68, 71, 90))
+                            .corner_radius(6.0),
+                        )
+                        .clicked()
+                    {
+                        self.selected_anime = None;
+                    }
+                });
+                if self.selected_anime.is_none() {
+                    return;
+                }
+                let rep = *self.member_to_rep.get(&sel).unwrap_or(&sel);
+                let members: Vec<usize> = self
+                    .rep_members
+                    .get(&rep)
+                    .cloned()
+                    .unwrap_or_else(|| vec![sel]);
+                let us_enabled = self.settings.uniquestream_enabled;
+                let members: Vec<usize> = members
+                    .into_iter()
+                    .filter(|&m| us_enabled || self.animes[m].source != AnimeSource::Uniquestream)
+                    .collect();
+                if members.len() > 1 {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Source :")
+                                .size(12.0)
+                                .color(Color32::from_rgb(150, 150, 160)),
+                        );
+                        let mut switch_to: Option<usize> = None;
+                        for &m in &members {
+                            let (lbl, col) = match self.animes[m].source {
+                                AnimeSource::Franime => ("franime", Color32::from_rgb(189, 147, 249)),
+                                AnimeSource::Uniquestream => ("uniquestream", Color32::from_rgb(139, 233, 253)),
+                                AnimeSource::Voiranime => ("voiranime", Color32::from_rgb(255, 184, 108)),
+                                AnimeSource::Animesama => ("anime-sama", Color32::from_rgb(241, 196, 64)),
+                            };
+                            let selected = m == sel;
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(lbl).size(12.0).color(if selected {
+                                            Color32::BLACK
+                                        } else {
+                                            Color32::WHITE
+                                        }),
+                                    )
+                                    .fill(if selected {
+                                        col
+                                    } else {
+                                        Color32::from_rgb(50, 52, 64)
+                                    })
+                                    .corner_radius(5.0),
+                                )
+                                .clicked()
+                            {
+                                switch_to = Some(m);
+                            }
+                        }
+                        if let Some(m) = switch_to {
+                            self.selected_anime = Some(m);
+                            self.animes[m].expanded = true;
+                            self.trigger_us_load(m);
+                            self.trigger_va_load(m);
+                            self.trigger_as_load(m);
+                        }
+                    });
+                }
+                let sel = self.selected_anime.unwrap_or(sel);
+                ui.add_space(10.0);
+                self.animes[sel].expanded = true;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        self.render_anime_card(ui, sel, ctx);
+                    });
+                return;
+            }
+        }
+
+        let mut sort_changed = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Trier par")
+                    .size(11.0)
+                    .color(Color32::from_rgb(150, 150, 160)),
+            );
+            egui::ComboBox::from_id_salt("catalogue_sort")
+                .selected_text(self.sort_mode.label())
+                .show_ui(ui, |ui| {
+                    for m in SortMode::all() {
+                        if ui
+                            .selectable_label(self.sort_mode == m, m.label())
+                            .clicked()
+                        {
+                            self.sort_mode = m;
+                            if m == SortMode::RecentlyAdded {
+                                self.sort_descending = true;
+                            }
+                            sort_changed = true;
+                        }
+                    }
+                });
+            if ui
+                .button(if self.sort_descending {
+                    RichText::new("Décroissant").size(11.0)
+                } else {
+                    RichText::new("Croissant").size(11.0)
+                })
+                .clicked()
+            {
+                self.sort_descending = !self.sort_descending;
+                sort_changed = true;
+            }
+            self.render_active_filter_chips(ui, &mut sort_changed);
+        });
+        if sort_changed {
+            self.filter_animes();
+        }
+        ui.add_space(10.0);
+
+        let on_home = self.search_query.trim().is_empty()
+            && self.selected_themes.is_empty()
+            && self.lang_filter == LangFilter::All
+            && !self.only_downloaded
+            && self.view_mode == ViewMode::Catalogue;
+        let indices = self.current_view_indices();
+        if indices.is_empty() {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        let msg = if self.view_mode == ViewMode::MaListe {
+                            "Ta liste est vide. Note ou commente un anime, ou télécharge un épisode pour qu'il apparaisse ici."
+                        } else if self.animes.is_empty() {
+                            "Aucun anime en base. Clique sur \"Synchroniser API\" dans le panneau de gauche."
+                        } else {
+                            "Aucun anime ne correspond à ta recherche."
+                        };
+                        ui.label(
+                            RichText::new(msg)
+                                .size(14.0)
+                                .color(Color32::from_rgb(150, 150, 160)),
+                        );
+                    });
+                });
+            return;
+        }
+
+        let cell_w = 168.0_f32;
+        let spacing = 14.0_f32;
+        let poster_h = 224.0_f32;
+        let row_h = poster_h + 130.0;
+        let usable = (ui.available_width() - 20.0).max(cell_w);
+        let columns = (((usable + spacing) / (cell_w + spacing)).floor() as usize).max(1);
+        let total = indices.len();
+        let rows = total.div_ceil(columns);
+
+        let mut clicked: Option<usize> = None;
+        let mut dl_all: Option<(usize, &'static str)> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show_viewport(ui, |ui, viewport| {
+                let origin = ui.cursor().top();
+                if on_home {
+                    self.render_discovery_header(ui, ctx);
+                }
+                let header_h = ui.cursor().top() - origin;
+
+                let first = (((viewport.min.y - header_h) / row_h).floor().max(0.0)) as usize;
+                let first = first.min(rows);
+                let last = ((((viewport.max.y - header_h) / row_h).ceil()).max(0.0) as usize)
+                    .clamp(first, rows);
+
+                if first > 0 {
+                    ui.add_space(first as f32 * row_h);
+                }
+                for row in first..last {
+                    ui.horizontal(|ui| {
+                        for col in 0..columns {
+                            let i = row * columns + col;
+                            if i >= total {
+                                break;
+                            }
+                            let idx = indices[i];
+                            let (open, dl_lang) =
+                                self.render_poster_cell(ui, idx, ctx, cell_w, poster_h);
+                            if open {
+                                clicked = Some(idx);
+                            }
+                            if let Some(lang) = dl_lang {
+                                dl_all = Some((idx, lang));
+                            }
+                            if col + 1 < columns && i + 1 < total {
+                                ui.add_space(spacing);
+                            }
+                        }
+                    });
+                    ui.add_space(spacing);
+                }
+                if last < rows {
+                    ui.add_space((rows - last) as f32 * row_h);
+                }
+            });
+
+        if let Some(idx) = clicked {
+            self.selected_anime = Some(idx);
+            self.animes[idx].expanded = true;
+            self.trigger_us_load(idx);
+            self.trigger_va_load(idx);
+            self.trigger_as_load(idx);
+        }
+        if let Some((idx, lang)) = dl_all {
+            let has_episodes = self.animes[idx].total_episodes() > 0;
+            if has_episodes {
+                let anime = self.animes[idx].anime.clone();
+                let title = anime.title.clone();
+                self.enqueue_anime(&anime, lang, None, None);
+                self.push_toast(
+                    ToastKind::Info,
+                    format!("Téléchargement lancé ({})", lang.to_uppercase()),
+                    truncate_str(&title, 60),
+                );
+            } else {
+                self.selected_anime = Some(idx);
+                self.animes[idx].expanded = true;
+                self.trigger_us_load(idx);
+                self.trigger_va_load(idx);
+            self.trigger_as_load(idx);
+                self.push_toast(
+                    ToastKind::Info,
+                    "Chargement des épisodes",
+                    "Ouvre la fiche puis relance le téléchargement.",
+                );
+            }
+        }
+    }
+
+    fn render_poster_cell(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        ctx: &egui::Context,
+        cell_w: f32,
+        poster_h: f32,
+    ) -> (bool, Option<&'static str>) {
+        let (image_url, title, downloaded, source, nsfw, themes, has_vo, has_vf) = {
+            let a = &self.animes[idx];
+            (
+                a.anime
+                    .affiche_small
+                    .clone()
+                    .unwrap_or_else(|| a.anime.affiche.clone()),
+                a.anime.title.clone(),
+                a.is_downloaded,
+                a.source,
+                a.anime.nsfw,
+                a.anime
+                    .themes
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<String>>(),
+                a.has_vo,
+                a.has_vf,
+            )
+        };
+        let texture = self.load_image_from_db(&image_url, ctx);
+        let group_sources: Vec<AnimeSource> = {
+            let us_enabled = self.settings.uniquestream_enabled;
+            let mut v: Vec<AnimeSource> = self
+                .rep_members
+                .get(&idx)
+                .map(|ms| ms.iter().map(|&m| self.animes[m].source).collect())
+                .unwrap_or_else(|| vec![source]);
+            v.retain(|s| us_enabled || *s != AnimeSource::Uniquestream);
+            v.sort_by_key(|s| -source_priority(*s));
+            v.dedup();
+            v
+        };
+        let mut open = false;
+        let mut dl_lang: Option<&'static str> = None;
+        ui.allocate_ui_with_layout(
+            Vec2::new(cell_w, poster_h + 116.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+            egui::Frame::NONE
+                .fill(Color32::from_rgb(40, 42, 54))
+                .corner_radius(10.0)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.set_width(cell_w - 16.0);
+                    let img_w = cell_w - 16.0;
+                    let img_size = Vec2::new(img_w, poster_h);
+                    let img_resp = if let Some(tex) = &texture {
+                        ui.add(egui::Button::image((tex.id(), img_size)).frame(false))
+                    } else {
+                        let (rect, resp) = ui.allocate_exact_size(img_size, egui::Sense::click());
+                        ui.painter()
+                            .rect_filled(rect, 6.0, Color32::from_rgb(30, 32, 44));
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "…",
+                            egui::FontId::proportional(20.0),
+                            Color32::from_rgb(90, 92, 104),
+                        );
+                        resp
+                    };
+                    if img_resp.clicked() {
+                        open = true;
+                    }
+                    if img_resp.hovered() {
+                        ui.painter().rect_stroke(
+                            img_resp.rect,
+                            6.0,
+                            egui::Stroke::new(2.0_f32, Color32::from_rgb(189, 147, 249)),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    paint_corner_badges(ui.painter(), img_resp.rect, nsfw, downloaded);
+
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(truncate_str(&title, 44))
+                            .size(11.0)
+                            .strong()
+                            .color(Color32::from_rgb(225, 225, 235)),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        let multi = group_sources.len() > 1;
+                        for s in &group_sources {
+                            match s {
+                                AnimeSource::Franime => {
+                                    if multi {
+                                        badge(ui, "FR", Color32::from_rgb(189, 147, 249), Color32::BLACK);
+                                    }
+                                }
+                                AnimeSource::Uniquestream => {
+                                    badge(ui, "US", Color32::from_rgb(139, 233, 253), Color32::BLACK)
+                                }
+                                AnimeSource::Voiranime => {
+                                    badge(ui, "VA", Color32::from_rgb(255, 184, 108), Color32::BLACK)
+                                }
+                                AnimeSource::Animesama => {
+                                    badge(ui, "AS", Color32::from_rgb(241, 196, 64), Color32::BLACK)
+                                }
+                            }
+                        }
+                        if has_vo {
+                            badge(ui, "VO", Color32::from_rgb(80, 250, 123), Color32::BLACK);
+                        }
+                        if has_vf {
+                            badge(ui, "VF", Color32::from_rgb(255, 121, 198), Color32::BLACK);
+                        }
+                    });
+                    if !themes.is_empty() {
+                        ui.label(
+                            RichText::new(truncate_str(&themes.join(" · "), 40))
+                                .size(9.0)
+                                .color(Color32::from_rgb(150, 150, 160)),
+                        );
+                    }
+                    ui.add_space(2.0);
+                    if has_vo || has_vf {
+                        ui.menu_button(
+                            RichText::new("Télécharger tout")
+                                .size(10.0)
+                                .color(Color32::from_rgb(80, 250, 123)),
+                            |ui| {
+                                if has_vo && ui.button("Tout en VO").clicked() {
+                                    dl_lang = Some("vo");
+                                    ui.close();
+                                }
+                                if has_vf && ui.button("Tout en VF").clicked() {
+                                    dl_lang = Some("vf");
+                                    ui.close();
+                                }
+                            },
+                        );
+                    }
+                });
+        });
+        (open, dl_lang)
+    }
+
+    fn render_discovery_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.new_ep_alerts.is_empty() && self.recommended.is_empty() {
+            return;
+        }
+        let mut open: Option<usize> = None;
+        let mut dl_new: Option<(usize, &'static str)> = None;
+
+        if !self.new_ep_alerts.is_empty() {
+            ui.label(
+                RichText::new("Nouveaux épisodes pour tes animes")
+                    .size(15.0)
+                    .strong()
+                    .color(Color32::from_rgb(80, 250, 123)),
+            );
+            ui.add_space(4.0);
+            let alerts = self.new_ep_alerts.clone();
+            egui::ScrollArea::horizontal()
+                .id_salt("disco_new")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (idx, count, lang) in &alerts {
+                            let (o, d) =
+                                self.render_compact_cell(ui, *idx, ctx, Some((*count, *lang)));
+                            if o {
+                                open = Some(*idx);
+                            }
+                            if d {
+                                dl_new = Some((*idx, *lang));
+                            }
+                            ui.add_space(10.0);
+                        }
+                    });
+                });
+            ui.add_space(10.0);
+        }
+
+        if !self.recommended.is_empty() {
+            ui.label(
+                RichText::new("Recommandé pour toi")
+                    .size(15.0)
+                    .strong()
+                    .color(Color32::from_rgb(189, 147, 249)),
+            );
+            ui.add_space(4.0);
+            let recs = self.recommended.clone();
+            egui::ScrollArea::horizontal()
+                .id_salt("disco_rec")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for idx in &recs {
+                            let (o, _) = self.render_compact_cell(ui, *idx, ctx, None);
+                            if o {
+                                open = Some(*idx);
+                            }
+                            ui.add_space(10.0);
+                        }
+                    });
+                });
+            ui.add_space(8.0);
+        }
+
+        ui.separator();
+        ui.add_space(8.0);
+
+        if let Some(idx) = open {
+            self.selected_anime = Some(idx);
+            self.animes[idx].expanded = true;
+            self.trigger_us_load(idx);
+            self.trigger_va_load(idx);
+            self.trigger_as_load(idx);
+        }
+        if let Some((idx, lang)) = dl_new {
+            self.enqueue_new_episodes(idx, lang);
+        }
+    }
+
+    fn render_compact_cell(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        ctx: &egui::Context,
+        alert: Option<(usize, &'static str)>,
+    ) -> (bool, bool) {
+        let (image_url, title) = {
+            let a = &self.animes[idx];
+            (
+                a.anime
+                    .affiche_small
+                    .clone()
+                    .unwrap_or_else(|| a.anime.affiche.clone()),
+                a.anime.title.clone(),
+            )
+        };
+        let texture = self.load_image_from_db(&image_url, ctx);
+        let cell_w = 124.0_f32;
+        let img_h = 156.0_f32;
+        let mut open = false;
+        let mut dl = false;
+        ui.allocate_ui_with_layout(
+            Vec2::new(cell_w, img_h + 70.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(40, 42, 54))
+                    .corner_radius(8.0)
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.set_width(cell_w - 12.0);
+                        let img_w = cell_w - 12.0;
+                        let img_size = Vec2::new(img_w, img_h);
+                        let img_resp = if let Some(tex) = &texture {
+                            ui.add(egui::Button::image((tex.id(), img_size)).frame(false))
+                        } else {
+                            let (rect, resp) =
+                                ui.allocate_exact_size(img_size, egui::Sense::click());
+                            ui.painter()
+                                .rect_filled(rect, 6.0, Color32::from_rgb(30, 32, 44));
+                            resp
+                        };
+                        if img_resp.clicked() {
+                            open = true;
+                        }
+                        if img_resp.hovered() {
+                            ui.painter().rect_stroke(
+                                img_resp.rect,
+                                6.0,
+                                egui::Stroke::new(2.0_f32, Color32::from_rgb(189, 147, 249)),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if let Some((count, _)) = alert {
+                            paint_corner_text(
+                                ui.painter(),
+                                img_resp.rect,
+                                &format!("+{}", count),
+                                Color32::from_rgb(80, 250, 123),
+                            );
+                        }
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(truncate_str(&title, 30))
+                                .size(10.0)
+                                .color(Color32::from_rgb(220, 220, 230)),
+                        );
+                        if let Some((count, lang)) = alert {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!(
+                                            "DL {} nouv. {}",
+                                            count,
+                                            lang.to_uppercase()
+                                        ))
+                                        .size(9.0)
+                                        .color(Color32::BLACK),
+                                    )
+                                    .fill(Color32::from_rgb(80, 250, 123))
+                                    .corner_radius(4.0)
+                                    .min_size(Vec2::new(img_w, 18.0)),
+                                )
+                                .clicked()
+                            {
+                                dl = true;
+                            }
+                        }
+                    });
+            },
+        );
+        (open, dl)
+    }
+
+    fn enqueue_new_episodes(&self, idx: usize, lang: &'static str) {
+        let id = self.animes[idx].anime.id.to_bits();
+        let dls = self.downloaded_eps.get(&id).cloned().unwrap_or_default();
+        let anime = self.animes[idx].anime.clone();
+        let dl_max = dls
+            .iter()
+            .map(|(s, e, _)| abs_episode_index(&anime, *s, *e))
+            .max()
+            .unwrap_or(0);
+        let avail = self.animes[idx].total_episodes();
+        if avail == 0 {
+            return;
+        }
+        for abs in (dl_max + 1)..=(avail - 1) {
+            if let Some((s, e)) = locate_absolute_episode(&anime, abs) {
+                self.enqueue_download(&anime, s, e, lang, None);
+            }
+        }
+        self.push_toast(
+            ToastKind::Info,
+            "Nouveaux épisodes",
+            truncate_str(&anime.title, 50),
+        );
+    }
+
+    fn render_malist_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.selected_anime.is_some() {
+            self.render_catalogue(ui, ctx);
+            return;
+        }
+        let base = self.current_view_indices();
+        let mut counts: HashMap<UserStatus, usize> = HashMap::new();
+        for &i in &base {
+            if let Some(s) = self.animes[i].user_status {
+                *counts.entry(s).or_insert(0) += 1;
+            }
+        }
+        let filter = self.malist_status_filter;
+        ui.horizontal_wrapped(|ui| {
+            let sel = filter.is_none();
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!("Tous ({})", base.len()))
+                            .size(12.0)
+                            .color(if sel { Color32::BLACK } else { Color32::WHITE }),
+                    )
+                    .fill(if sel {
+                        Color32::from_rgb(189, 147, 249)
+                    } else {
+                        Color32::from_rgb(50, 52, 64)
+                    })
+                    .corner_radius(5.0),
+                )
+                .clicked()
+            {
+                self.malist_status_filter = None;
+            }
+            for s in UserStatus::all() {
+                let c = *counts.get(&s).unwrap_or(&0);
+                let sel = filter == Some(s);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{} ({})", s.label(), c))
+                                .size(12.0)
+                                .color(if sel { Color32::BLACK } else { Color32::WHITE }),
+                        )
+                        .fill(if sel { s.color() } else { Color32::from_rgb(50, 52, 64) })
+                        .corner_radius(5.0),
+                    )
+                    .clicked()
+                {
+                    self.malist_status_filter = Some(s);
+                }
+            }
+        });
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Ajouter")
+                    .size(11.0)
+                    .color(Color32::from_rgb(150, 150, 160)),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.malist_add_query)
+                    .hint_text("titre à ajouter au suivi…")
+                    .desired_width(260.0),
+            );
+            if !self.malist_add_query.is_empty()
+                && ui.button(RichText::new("×").size(12.0)).clicked()
+            {
+                self.malist_add_query.clear();
+            }
+        });
+        let q = self.malist_add_query.trim().to_lowercase();
+        let mut add_idx: Option<usize> = None;
+        if q.len() >= 2 {
+            let matches: Vec<usize> = self
+                .animes
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| {
+                    a.user_status.is_none()
+                        && a.user_rating.is_none()
+                        && a.user_comment.is_empty()
+                        && a.user_tags.is_empty()
+                        && a.anime.title.to_lowercase().contains(&q)
+                })
+                .map(|(i, _)| i)
+                .take(10)
+                .collect();
+            if matches.is_empty() {
+                ui.label(
+                    RichText::new("Aucun anime non-suivi ne correspond.")
+                        .size(10.0)
+                        .color(Color32::from_rgb(120, 120, 130))
+                        .italics(),
+                );
+            } else {
+                egui::ScrollArea::horizontal()
+                    .id_salt("malist_add_results")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for i in &matches {
+                                if ui
+                                    .button(
+                                        RichText::new(format!(
+                                            "+ {}",
+                                            truncate_str(&self.animes[*i].anime.title, 32)
+                                        ))
+                                        .size(11.0),
+                                    )
+                                    .clicked()
+                                {
+                                    add_idx = Some(*i);
+                                }
+                            }
+                        });
+                    });
+            }
+        }
+        if let Some(i) = add_idx {
+            self.add_to_malist(i);
+            self.malist_add_query.clear();
+            self.filter_animes();
+        }
+        ui.add_space(10.0);
+
+        let shown: Vec<usize> = base
+            .into_iter()
+            .filter(|&i| filter.map_or(true, |f| self.animes[i].user_status == Some(f)))
+            .collect();
+        if shown.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(60.0);
+                ui.label(
+                    RichText::new("Rien ici. Note, commente ou change le statut d'un anime depuis sa fiche pour le suivre.")
+                        .size(13.0)
+                        .color(Color32::from_rgb(150, 150, 160))
+                        .italics(),
+                );
+            });
+            return;
+        }
+
+        let mut open: Option<usize> = None;
+        let mut status_change: Option<(usize, Option<UserStatus>)> = None;
+        let mut rating_change: Option<(usize, Option<f32>)> = None;
+        let mut dl: Option<(usize, &'static str)> = None;
+        let mut remove: Option<usize> = None;
+
+        let status_order = [
+            (Some(UserStatus::EnCours), "En cours"),
+            (Some(UserStatus::AVoir), "À voir"),
+            (Some(UserStatus::Pause), "En pause"),
+            (Some(UserStatus::Termine), "Terminé"),
+            (Some(UserStatus::Abandonne), "Abandonné"),
+            (None, "Sans statut / téléchargés"),
+        ];
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                for (st, label) in status_order {
+                    let section: Vec<usize> = shown
+                        .iter()
+                        .copied()
+                        .filter(|&i| self.animes[i].user_status == st)
+                        .collect();
+                    if section.is_empty() {
+                        continue;
+                    }
+                    let color = st
+                        .map(|s| s.color())
+                        .unwrap_or(Color32::from_rgb(120, 120, 130));
+                    ui.horizontal(|ui| {
+                        let (rect, _) =
+                            ui.allocate_exact_size(Vec2::new(8.0, 18.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 2.0, color);
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!("{}  ({})", label, section.len()))
+                                .size(15.0)
+                                .strong()
+                                .color(color),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    egui::ScrollArea::horizontal()
+                        .id_salt(("malist_sec", label))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for idx in &section {
+                                    let (o, st2, rt, d, rm) =
+                                        self.render_malist_card(ui, *idx, ctx);
+                                    if o {
+                                        open = Some(*idx);
+                                    }
+                                    if let Some(s) = st2 {
+                                        status_change = Some((*idx, s));
+                                    }
+                                    if let Some(r) = rt {
+                                        rating_change = Some((*idx, r));
+                                    }
+                                    if let Some(l) = d {
+                                        dl = Some((*idx, l));
+                                    }
+                                    if rm {
+                                        remove = Some(*idx);
+                                    }
+                                    ui.add_space(10.0);
+                                }
+                            });
+                        });
+                    ui.add_space(18.0);
+                }
+            });
+
+        if let Some(idx) = remove {
+            self.remove_from_malist(idx);
+            self.filter_animes();
+        }
+        if let Some(idx) = open {
+            self.selected_anime = Some(idx);
+            self.animes[idx].expanded = true;
+            self.trigger_us_load(idx);
+            self.trigger_va_load(idx);
+            self.trigger_as_load(idx);
+        }
+        if let Some((idx, st)) = status_change {
+            self.animes[idx].user_status = st;
+            let id = self.animes[idx].anime.id;
+            let key = st.map(|s| s.as_db_key());
+            let db = self.db.clone();
+            self.runtime.spawn(async move {
+                let g = db.lock().await;
+                let _ = g.set_user_status(id, key);
+            });
+        }
+        if let Some((idx, r)) = rating_change {
+            self.animes[idx].user_rating = r;
+            let id = self.animes[idx].anime.id;
+            let db = self.db.clone();
+            self.runtime.spawn(async move {
+                let g = db.lock().await;
+                let _ = g.set_user_rating(id, r);
+            });
+        }
+        if let Some((idx, lang)) = dl {
+            let anime = self.animes[idx].anime.clone();
+            let title = anime.title.clone();
+            self.enqueue_anime(&anime, lang, None, None);
+            self.push_toast(
+                ToastKind::Info,
+                format!("Téléchargement {} lancé", lang.to_uppercase()),
+                truncate_str(&title, 50),
+            );
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn render_malist_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        ctx: &egui::Context,
+    ) -> (
+        bool,
+        Option<Option<UserStatus>>,
+        Option<Option<f32>>,
+        Option<&'static str>,
+        bool,
+    ) {
+        let (image_url, title, has_vo, has_vf, total_eps, cur_status, cur_rating) = {
+            let a = &self.animes[idx];
+            (
+                a.anime
+                    .affiche_small
+                    .clone()
+                    .unwrap_or_else(|| a.anime.affiche.clone()),
+                a.anime.title.clone(),
+                a.has_vo,
+                a.has_vf,
+                a.total_episodes(),
+                a.user_status,
+                a.user_rating,
+            )
+        };
+        let dl_count = self
+            .downloaded_eps
+            .get(&self.animes[idx].anime.id.to_bits())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let texture = self.load_image_from_db(&image_url, ctx);
+
+        let cell_w = 158.0_f32;
+        let img_h = 210.0_f32;
+        let mut open = false;
+        let mut status_out: Option<Option<UserStatus>> = None;
+        let mut rating_out: Option<Option<f32>> = None;
+        let mut dl_out: Option<&'static str> = None;
+        let mut remove = false;
+
+        ui.allocate_ui_with_layout(
+            Vec2::new(cell_w, img_h + 94.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(40, 42, 54))
+                    .corner_radius(10.0)
+                    .inner_margin(7.0)
+                    .show(ui, |ui| {
+                        ui.set_width(cell_w - 14.0);
+                        let img_w = cell_w - 14.0;
+                        let img_size = Vec2::new(img_w, img_h);
+                        let img_resp = if let Some(tex) = &texture {
+                            ui.add(egui::Button::image((tex.id(), img_size)).frame(false))
+                        } else {
+                            let (rect, r) = ui.allocate_exact_size(img_size, egui::Sense::click());
+                            ui.painter()
+                                .rect_filled(rect, 6.0, Color32::from_rgb(30, 32, 44));
+                            r
+                        };
+                        if img_resp.clicked() {
+                            open = true;
+                        }
+                        if img_resp.hovered() {
+                            ui.painter().rect_stroke(
+                                img_resp.rect,
+                                6.0,
+                                egui::Stroke::new(2.0_f32, Color32::from_rgb(189, 147, 249)),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if let Some(s) = cur_status {
+                            let p = ui.painter();
+                            let font = egui::FontId::proportional(9.5);
+                            let galley = p.layout_no_wrap(s.label().to_string(), font, Color32::BLACK);
+                            let pad = egui::vec2(4.0, 1.5);
+                            let size = galley.size() + pad * 2.0;
+                            let min = egui::pos2(img_resp.rect.left() + 4.0, img_resp.rect.top() + 4.0);
+                            p.rect_filled(egui::Rect::from_min_size(min, size), 3.0, s.color());
+                            p.galley(min + pad, galley, Color32::BLACK);
+                        }
+                        if total_eps > 0 && dl_count > 0 {
+                            let p = ui.painter();
+                            let frac = (dl_count as f32 / total_eps as f32).clamp(0.0, 1.0);
+                            let h = 5.0;
+                            let bg = egui::Rect::from_min_max(
+                                egui::pos2(img_resp.rect.left(), img_resp.rect.bottom() - h),
+                                img_resp.rect.right_bottom(),
+                            );
+                            p.rect_filled(bg, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 150));
+                            let mut fill = bg;
+                            fill.set_width(bg.width() * frac);
+                            p.rect_filled(fill, 0.0, Color32::from_rgb(80, 250, 123));
+                        }
+
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new(truncate_str(&title, 36))
+                                .size(11.0)
+                                .strong()
+                                .color(Color32::from_rgb(225, 225, 235)),
+                        );
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            let menu_label = cur_status.map(|s| s.label()).unwrap_or("Gérer");
+                            let menu_color = cur_status
+                                .map(|s| s.color())
+                                .unwrap_or(Color32::from_rgb(189, 147, 249));
+                            ui.menu_button(
+                                RichText::new(menu_label).size(10.0).color(menu_color),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("Statut")
+                                            .size(10.0)
+                                            .color(Color32::from_rgb(150, 150, 160)),
+                                    );
+                                    if ui.selectable_label(cur_status.is_none(), "— Aucun").clicked()
+                                    {
+                                        status_out = Some(None);
+                                        ui.close();
+                                    }
+                                    for s in UserStatus::all() {
+                                        if ui
+                                            .selectable_label(cur_status == Some(s), s.label())
+                                            .clicked()
+                                        {
+                                            status_out = Some(Some(s));
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Note").size(11.0));
+                                        let mut r = cur_rating.unwrap_or(0.0);
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut r)
+                                                    .range(0.0..=10.0)
+                                                    .speed(0.5),
+                                            )
+                                            .changed()
+                                        {
+                                            rating_out =
+                                                Some(if r <= 0.0 { None } else { Some(r) });
+                                        }
+                                    });
+                                    ui.separator();
+                                    if has_vo && ui.button("Télécharger VO").clicked() {
+                                        dl_out = Some("vo");
+                                        ui.close();
+                                    }
+                                    if has_vf && ui.button("Télécharger VF").clicked() {
+                                        dl_out = Some("vf");
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui
+                                        .button(
+                                            RichText::new("Retirer du suivi")
+                                                .color(Color32::from_rgb(255, 120, 120)),
+                                        )
+                                        .clicked()
+                                    {
+                                        remove = true;
+                                        ui.close();
+                                    }
+                                },
+                            );
+                            if let Some(r) = cur_rating {
+                                ui.label(
+                                    RichText::new(format!("{:.1}", r))
+                                        .size(10.0)
+                                        .color(Color32::from_rgb(241, 196, 15)),
+                                );
+                            }
+                        });
+                    });
+            },
+        );
+
+        (open, status_out, rating_out, dl_out, remove)
+    }
+
+    fn add_to_malist(&mut self, idx: usize) {
+        if self.animes[idx].user_status.is_none() {
+            self.animes[idx].user_status = Some(UserStatus::AVoir);
+        }
+        let id = self.animes[idx].anime.id;
+        let key = self.animes[idx].user_status.map(|s| s.as_db_key());
+        let title = self.animes[idx].anime.title.clone();
+        let db = self.db.clone();
+        self.runtime.spawn(async move {
+            let g = db.lock().await;
+            let _ = g.set_user_status(id, key);
+        });
+        self.push_toast(ToastKind::Info, "Ajouté à ta liste", truncate_str(&title, 50));
+    }
+
+    fn remove_from_malist(&mut self, idx: usize) {
+        let id = self.animes[idx].anime.id;
+        let tags = self.animes[idx].user_tags.clone();
+        let title = self.animes[idx].anime.title.clone();
+        self.animes[idx].user_status = None;
+        self.animes[idx].user_rating = None;
+        self.animes[idx].user_comment.clear();
+        self.animes[idx].user_tags.clear();
+        let db = self.db.clone();
+        self.runtime.spawn(async move {
+            let g = db.lock().await;
+            let _ = g.set_user_status(id, None);
+            let _ = g.set_user_rating(id, None);
+            let _ = g.set_user_comment(id, None);
+            for t in &tags {
+                let _ = g.remove_tag(id, t);
+            }
+        });
+        self.push_toast(ToastKind::Info, "Retiré du suivi", truncate_str(&title, 50));
+    }
+
+    fn render_active_filter_chips(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let chip = |ui: &mut egui::Ui, label: String| -> bool {
+                ui.add(
+                    egui::Button::new(
+                        RichText::new(format!("{} ×", label))
+                            .size(10.0)
+                            .color(Color32::BLACK),
+                    )
+                    .fill(Color32::from_rgb(189, 147, 249))
+                    .corner_radius(4.0),
+                )
+                .clicked()
+            };
+            if self.lang_filter != LangFilter::All {
+                let lbl = match self.lang_filter {
+                    LangFilter::VO => "VO",
+                    LangFilter::VF => "VF",
+                    LangFilter::Both => "VO+VF",
+                    LangFilter::All => "",
+                };
+                if chip(ui, lbl.to_string()) {
+                    self.lang_filter = LangFilter::All;
+                    *changed = true;
+                }
+            }
+            if self.only_downloaded && chip(ui, "Téléchargés".to_string()) {
+                self.only_downloaded = false;
+                *changed = true;
+            }
+            if self.min_user_rating > 0.0 && chip(ui, format!("Note ≥ {:.1}", self.min_user_rating))
+            {
+                self.min_user_rating = 0.0;
+                *changed = true;
+            }
+            let themes: Vec<String> = self.selected_themes.iter().cloned().collect();
+            for t in themes {
+                if chip(ui, t.clone()) {
+                    self.selected_themes.remove(&t);
+                    *changed = true;
+                }
+            }
+            if !self.search_query.is_empty() && chip(ui, format!("« {} »", truncate_str(&self.search_query, 16))) {
+                self.search_query.clear();
+                *changed = true;
+            }
+        });
+    }
 }
 
 fn badge(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32) {
-    egui::Frame::NONE
+    let resp = egui::Frame::NONE
         .fill(bg)
         .corner_radius(4.0)
         .inner_margin(egui::vec2(8.0, 3.0))
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(12.0).color(fg).strong());
-        });
+        })
+        .response
+        .interact(egui::Sense::hover());
+    if let Some(desc) = badge_description(text) {
+        resp.on_hover_text(desc);
+    }
+}
+
+fn badge_description(text: &str) -> Option<&'static str> {
+    match text {
+        "VO" => Some("Version originale (japonais, sous-titré)"),
+        "VF" => Some("Version française (doublée)"),
+        "FR" => Some("Source : franime.fr"),
+        "US" => Some("Source : uniquestream (en-US / ja-JP)"),
+        "VA" => Some("Source : voir-anime.to"),
+        "AS" => Some("Source : anime-sama.to"),
+        "DL" => Some("Déjà téléchargé"),
+        "18+" => Some("Contenu NSFW"),
+        _ => None,
+    }
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -4506,6 +6943,105 @@ fn truncate_str(s: &str, max: usize) -> String {
     format!("{}…", &s[..cut])
 }
 
+fn source_priority(s: AnimeSource) -> i32 {
+    match s {
+        AnimeSource::Franime => 4,
+        AnimeSource::Animesama => 3,
+        AnimeSource::Voiranime => 2,
+        AnimeSource::Uniquestream => 1,
+    }
+}
+
+fn normalize_title(s: &str) -> String {
+    let lower = s
+        .to_lowercase()
+        .replace("(vostfr)", " ")
+        .replace("(vost fr)", " ")
+        .replace("(vostf)", " ")
+        .replace("(vost)", " ")
+        .replace("(vf)", " ")
+        .replace("(vo)", " ")
+        .replace("(sub)", " ")
+        .replace("(dub)", " ");
+    let mut tokens: Vec<&str> = lower.split_whitespace().collect();
+    while let Some(last) = tokens.last() {
+        let l = last.trim_matches(|c: char| !c.is_alphanumeric());
+        if matches!(l, "vf" | "vostfr" | "vost" | "vo" | "vostf" | "sub" | "dub") {
+            tokens.pop();
+        } else {
+            break;
+        }
+    }
+    let joined = tokens.join(" ");
+    let mut out = String::new();
+    for c in joined.chars() {
+        let d = match c {
+            'à' | 'â' | 'ä' | 'á' | 'ã' | 'å' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'î' | 'ï' | 'í' | 'ì' => 'i',
+            'ô' | 'ö' | 'ó' | 'ò' | 'õ' => 'o',
+            'û' | 'ü' | 'ù' | 'ú' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            other => other,
+        };
+        if d.is_ascii_alphanumeric() {
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn extract_year(s: &str) -> Option<i32> {
+    let chars: Vec<char> = s.chars().collect();
+    for w in chars.windows(4) {
+        if w.iter().all(|c| c.is_ascii_digit()) {
+            let y: i32 = w.iter().collect::<String>().parse().ok()?;
+            if (1900..=2100).contains(&y) {
+                return Some(y);
+            }
+        }
+    }
+    None
+}
+
+fn paint_corner_text(painter: &egui::Painter, img_rect: egui::Rect, text: &str, bg: Color32) {
+    let font = egui::FontId::proportional(11.0);
+    let galley = painter.layout_no_wrap(text.to_string(), font, Color32::BLACK);
+    let pad = egui::vec2(5.0, 2.0);
+    let size = galley.size() + pad * 2.0;
+    let min = egui::pos2(img_rect.right() - 4.0 - size.x, img_rect.top() + 4.0);
+    let rect = egui::Rect::from_min_size(min, size);
+    painter.rect_filled(rect, 4.0, bg);
+    painter.galley(min + pad, galley, Color32::BLACK);
+}
+
+fn paint_corner_badges(
+    painter: &egui::Painter,
+    img_rect: egui::Rect,
+    nsfw: bool,
+    downloaded: bool,
+) {
+    let mut y = img_rect.top() + 5.0;
+    let mut draw = |text: &str, bg: Color32, fg: Color32| {
+        let font = egui::FontId::proportional(10.0);
+        let galley = painter.layout_no_wrap(text.to_string(), font, fg);
+        let pad = egui::vec2(5.0, 2.0);
+        let size = galley.size() + pad * 2.0;
+        let min = egui::pos2(img_rect.right() - 5.0 - size.x, y);
+        let rect = egui::Rect::from_min_size(min, size);
+        painter.rect_filled(rect, 4.0, bg);
+        painter.galley(min + pad, galley, fg);
+        y += size.y + 4.0;
+    };
+    if downloaded {
+        draw("DL", Color32::from_rgb(80, 250, 123), Color32::BLACK);
+    }
+    if nsfw {
+        draw("18+", Color32::from_rgb(255, 85, 85), Color32::WHITE);
+    }
+}
+
 fn host_menu<F: FnMut(Option<String>)>(
     ui: &mut egui::Ui,
     hosts: &[String],
@@ -4514,12 +7050,12 @@ fn host_menu<F: FnMut(Option<String>)>(
     ui.set_min_width(160.0);
     if ui.button("Auto (préférence)").clicked() {
         on_pick(None);
-        ui.close_menu();
+        ui.close();
     }
     for host in hosts {
         if ui.button(host).clicked() {
             on_pick(Some(host.clone()));
-            ui.close_menu();
+            ui.close();
         }
     }
 }
@@ -5006,7 +7542,9 @@ impl eframe::App for AnimeDownloaderApp {
         self.drain_sync_results();
         self.drain_us_load_results();
         self.drain_va_load_results();
+        self.drain_as_load_results();
         self.drain_image_loads(ctx);
+        self.drain_notifications();
         self.apply_theme(ctx);
         self.handle_shortcuts(ctx);
         let syncing = self.is_syncing.load(Ordering::SeqCst);
@@ -5023,19 +7561,21 @@ impl eframe::App for AnimeDownloaderApp {
         self.render_settings_window(ctx);
         self.render_close_confirm_window(ctx);
 
-        egui::SidePanel::left("nav_panel")
-            .resizable(true)
-            .default_width(280.0)
-            .min_width(240.0)
-            .max_width(360.0)
-            .frame(
-                egui::Frame::NONE
-                    .fill(Color32::from_rgb(30, 32, 44))
-                    .inner_margin(16.0),
-            )
-            .show(ctx, |ui| {
-                self.render_nav_panel(ui, ctx, syncing);
-            });
+        if !self.nav_collapsed {
+            egui::SidePanel::left("nav_panel")
+                .resizable(true)
+                .default_width(280.0)
+                .min_width(240.0)
+                .max_width(360.0)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(30, 32, 44))
+                        .inner_margin(16.0),
+                )
+                .show(ctx, |ui| {
+                    self.render_nav_panel(ui, ctx, syncing);
+                });
+        }
 
         egui::CentralPanel::default()
             .frame(
@@ -5048,6 +7588,23 @@ impl eframe::App for AnimeDownloaderApp {
 
                 let active_count = active_downloads;
                 ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Menu")
+                                    .size(13.0)
+                                    .color(Color32::from_rgb(200, 200, 210)),
+                            )
+                            .fill(Color32::from_rgb(50, 52, 64))
+                            .corner_radius(6.0)
+                            .min_size(Vec2::new(60.0, 32.0)),
+                        )
+                        .on_hover_text("Afficher / masquer le panneau latéral")
+                        .clicked()
+                    {
+                        self.nav_collapsed = !self.nav_collapsed;
+                    }
+                    ui.separator();
                     let mode_tab = |ui: &mut egui::Ui,
                                     label: String,
                                     selected: bool|
@@ -5160,100 +7717,17 @@ impl eframe::App for AnimeDownloaderApp {
                     ViewMode::Telechargements => self.render_downloads_page(ui),
                     ViewMode::Logs => self.render_logs_page(ui),
                     ViewMode::Stats => self.render_stats_page(ui),
-                    _ => {
-                        let mut sort_changed = false;
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("Trier par")
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(150, 150, 160)),
-                            );
-                            egui::ComboBox::from_id_salt("catalogue_sort")
-                                .selected_text(self.sort_mode.label())
-                                .show_ui(ui, |ui| {
-                                    for m in SortMode::all() {
-                                        if ui
-                                            .selectable_label(self.sort_mode == m, m.label())
-                                            .clicked()
-                                        {
-                                            self.sort_mode = m;
-                                            sort_changed = true;
-                                        }
-                                    }
-                                });
-                            if ui
-                                .button(if self.sort_descending {
-                                    RichText::new("Décroissant").size(11.0)
-                                } else {
-                                    RichText::new("Croissant").size(11.0)
-                                })
-                                .clicked()
-                            {
-                                self.sort_descending = !self.sort_descending;
-                                sort_changed = true;
-                            }
-                        });
-                        if sort_changed {
-                            self.filter_animes();
-                        }
-                        ui.add_space(10.0);
-
-                        let indices = self.current_view_indices();
-                        if indices.is_empty() {
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false; 2])
-                                .show(ui, |ui| {
-                                    ui.vertical_centered(|ui| {
-                                        ui.add_space(80.0);
-                                        let msg = if self.view_mode == ViewMode::MaListe {
-                                            "Ta liste est vide. Note ou commente un anime, ou télécharge un épisode pour qu'il apparaisse ici."
-                                        } else if self.animes.is_empty() {
-                                            "Aucun anime en base. Clique sur \"Synchroniser API\" dans le panneau de gauche."
-                                        } else {
-                                            "Aucun anime ne correspond à ta recherche."
-                                        };
-                                        ui.label(
-                                            RichText::new(msg)
-                                                .size(14.0)
-                                                .color(Color32::from_rgb(150, 150, 160)),
-                                        );
-                                    });
-                                });
-                        } else {
-                            let expanded_indices: Vec<usize> = indices
-                                .iter()
-                                .copied()
-                                .filter(|&i| self.animes[i].expanded)
-                                .collect();
-                            if !expanded_indices.is_empty() {
-                                egui::ScrollArea::vertical()
-                                    .auto_shrink([false; 2])
-                                    .show(ui, |ui| {
-                                        for idx in expanded_indices {
-                                            self.render_anime_card(ui, idx, ctx);
-                                            ui.add_space(12.0);
-                                        }
-                                    });
-                            } else {
-                                let row_h = 380.0_f32;
-                                let total = indices.len();
-                                egui::ScrollArea::vertical()
-                                    .auto_shrink([false; 2])
-                                    .show_rows(ui, row_h, total, |ui, range| {
-                                        for visible_i in range {
-                                            let idx = indices[visible_i];
-                                            self.render_anime_card(ui, idx, ctx);
-                                        }
-                                    });
-                            }
-                        }
-                    }
+                    ViewMode::MaListe => self.render_malist_page(ui, ctx),
+                    _ => self.render_catalogue(ui, ctx),
                 }
             });
+
+        self.render_toasts(ctx);
 
         if syncing
             || self.view_mode == ViewMode::Telechargements
             || self.view_mode == ViewMode::Logs
+            || !self.toasts.is_empty()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
@@ -5302,8 +7776,12 @@ impl AnimeDownloaderApp {
             self.view_mode = ViewMode::Logs;
         }
         if esc {
-            self.show_settings = false;
-            self.show_close_confirm = false;
+            if self.show_settings || self.show_close_confirm {
+                self.show_settings = false;
+                self.show_close_confirm = false;
+            } else if self.selected_anime.is_some() {
+                self.selected_anime = None;
+            }
         }
     }
 
@@ -5316,6 +7794,10 @@ impl AnimeDownloaderApp {
             } else {
                 egui::Visuals::light()
             });
+        }
+        let want_scale = self.settings.ui_scale.clamp(0.8, 1.8);
+        if (ctx.zoom_factor() - want_scale).abs() > 0.01 {
+            ctx.set_zoom_factor(want_scale);
         }
     }
 
@@ -5564,7 +8046,7 @@ impl AnimeDownloaderApp {
         ui.add_space(10.0);
 
         let filter = self.downloads_filter;
-        let filtered: Vec<&DownloadTask> = tasks
+        let filtered: Vec<DownloadTask> = tasks
             .iter()
             .filter(|t| match filter {
                 DownloadsFilter::All => true,
@@ -5575,7 +8057,49 @@ impl AnimeDownloaderApp {
                 DownloadsFilter::Failed => matches!(t.status, DlStatus::Failed(_)),
                 DownloadsFilter::Done => matches!(t.status, DlStatus::Completed),
             })
+            .cloned()
             .collect();
+
+        let originals = self.task_originals.lock().unwrap().clone();
+        let mut groups: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<usize, (String, Vec<DownloadTask>)>,
+        > = std::collections::BTreeMap::new();
+        for task in &filtered {
+            let (anime_name, season_idx, season_label) = match originals.get(&task.id) {
+                Some(o) => {
+                    let name = if o.anime.title_o.is_empty() {
+                        o.anime.title.clone()
+                    } else {
+                        o.anime.title_o.clone()
+                    };
+                    let slabel = o
+                        .anime
+                        .saisons
+                        .get(o.season_idx)
+                        .map(|s| s.title.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| format!("Saison {}", o.season_idx + 1));
+                    (name, o.season_idx, slabel)
+                }
+                None => ("Autres".to_string(), usize::MAX, "—".to_string()),
+            };
+            groups
+                .entry(anime_name)
+                .or_default()
+                .entry(season_idx)
+                .or_insert_with(|| (season_label, Vec::new()))
+                .1
+                .push(task.clone());
+        }
+
+        let is_active = |s: &DlStatus| {
+            matches!(
+                s,
+                DlStatus::Queued | DlStatus::Extracting | DlStatus::Downloading(_)
+            )
+        };
+        let mut cancel_request: Option<Vec<String>> = None;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
@@ -5591,12 +8115,117 @@ impl AnimeDownloaderApp {
                         );
                     });
                 } else {
-                    for task in filtered {
-                        self.render_task_row(ui, task);
-                        ui.add_space(6.0);
+                    for (anime_name, seasons) in &groups {
+                        let anime_active: Vec<String> = seasons
+                            .values()
+                            .flat_map(|(_, tasks)| tasks.iter())
+                            .filter(|t| is_active(&t.status))
+                            .map(|t| t.id.clone())
+                            .collect();
+                        let total_eps: usize = seasons.values().map(|(_, t)| t.len()).sum();
+
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgb(44, 46, 60))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(anime_name)
+                                            .size(15.0)
+                                            .strong()
+                                            .color(Color32::from_rgb(189, 147, 249)),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("{} épisode(s)", total_eps))
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(150, 150, 160)),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if !anime_active.is_empty()
+                                                && ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new(format!(
+                                                                "Tout annuler ({})",
+                                                                anime_active.len()
+                                                            ))
+                                                            .size(11.0)
+                                                            .color(Color32::WHITE),
+                                                        )
+                                                        .fill(Color32::from_rgb(200, 70, 70))
+                                                        .corner_radius(5.0),
+                                                    )
+                                                    .clicked()
+                                            {
+                                                cancel_request = Some(anime_active.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        ui.add_space(4.0);
+
+                        for (_sidx, (slabel, season_tasks)) in seasons {
+                            let season_active: Vec<String> = season_tasks
+                                .iter()
+                                .filter(|t| is_active(&t.status))
+                                .map(|t| t.id.clone())
+                                .collect();
+                            ui.horizontal(|ui| {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    RichText::new(slabel)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(139, 233, 253)),
+                                );
+                                ui.label(
+                                    RichText::new(format!("· {} ép.", season_tasks.len()))
+                                        .size(10.0)
+                                        .color(Color32::from_rgb(140, 140, 150)),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if !season_active.is_empty()
+                                            && ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new(format!(
+                                                            "Annuler la saison ({})",
+                                                            season_active.len()
+                                                        ))
+                                                        .size(10.0)
+                                                        .color(Color32::WHITE),
+                                                    )
+                                                    .fill(Color32::from_rgb(150, 70, 70))
+                                                    .corner_radius(5.0),
+                                                )
+                                                .clicked()
+                                        {
+                                            cancel_request = Some(season_active.clone());
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(2.0);
+                            for task in season_tasks {
+                                self.render_task_row(ui, task);
+                                ui.add_space(6.0);
+                            }
+                            ui.add_space(4.0);
+                        }
+                        ui.add_space(10.0);
                     }
                 }
             });
+
+        if let Some(ids) = cancel_request {
+            self.cancel_tasks(ids);
+        }
     }
 
     fn render_close_confirm_window(&mut self, ctx: &egui::Context) {
@@ -5695,6 +8324,21 @@ impl AnimeDownloaderApp {
         let with_status = self.animes.iter().filter(|a| a.user_status.is_some()).count();
         let tagged = self.animes.iter().filter(|a| !a.user_tags.is_empty()).count();
 
+        let mut src_counts = [0usize; 4];
+        let mut src_dl = [0usize; 4];
+        for a in &self.animes {
+            let i = match a.source {
+                AnimeSource::Franime => 0,
+                AnimeSource::Uniquestream => 1,
+                AnimeSource::Voiranime => 2,
+                AnimeSource::Animesama => 3,
+            };
+            src_counts[i] += 1;
+            if a.is_downloaded {
+                src_dl[i] += 1;
+            }
+        }
+
         let rating_avg = if !rated.is_empty() {
             rated.iter().sum::<f32>() / rated.len() as f32
         } else {
@@ -5752,8 +8396,11 @@ impl AnimeDownloaderApp {
             }
         }
         let mut top_themes: Vec<(String, usize)> = theme_counts.into_iter().collect();
-        top_themes.sort_by(|a, b| b.1.cmp(&a.1));
-        top_themes.truncate(15);
+        top_themes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let multi: Vec<(String, usize)> =
+            top_themes.iter().filter(|(_, c)| *c >= 2).cloned().collect();
+        let mut top_themes = if multi.len() >= 3 { multi } else { top_themes };
+        top_themes.truncate(12);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
@@ -5767,6 +8414,29 @@ impl AnimeDownloaderApp {
                     stat_card(ui, "Téléchargés", &downloaded_animes.to_string(), Color32::from_rgb(80, 250, 123));
                     stat_card(ui, "Épisodes DL", &total_eps_dl.to_string(), Color32::from_rgb(255, 121, 198));
                     stat_card(ui, "DL 7j", &recent_dl.to_string(), Color32::from_rgb(139, 233, 253));
+                });
+
+                ui.add_space(20.0);
+                section_header(ui, "Par source");
+                ui.horizontal_wrapped(|ui| {
+                    let labels = ["franime", "uniquestream", "voiranime", "anime-sama"];
+                    let colors = [
+                        Color32::from_rgb(189, 147, 249),
+                        Color32::from_rgb(139, 233, 253),
+                        Color32::from_rgb(255, 184, 108),
+                        Color32::from_rgb(241, 196, 64),
+                    ];
+                    for i in 0..4 {
+                        if src_counts[i] == 0 {
+                            continue;
+                        }
+                        stat_card(
+                            ui,
+                            labels[i],
+                            &format!("{} ({} dl)", src_counts[i], src_dl[i]),
+                            colors[i],
+                        );
+                    }
                 });
 
                 ui.add_space(20.0);
@@ -5854,22 +8524,23 @@ impl AnimeDownloaderApp {
                     let max_theme = top_themes.first().map(|(_, c)| *c).unwrap_or(1).max(1);
                     for (theme, count) in &top_themes {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(theme)
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(189, 147, 249))
-                                    .strong(),
+                            ui.add_sized(
+                                [150.0, 16.0],
+                                egui::Label::new(
+                                    RichText::new(truncate_str(theme, 22))
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(189, 147, 249))
+                                        .strong(),
+                                )
+                                .truncate(),
                             );
-                            let frac = *count as f32 / max_theme as f32;
+                            let frac = (*count as f32 / max_theme as f32).clamp(0.05, 1.0);
                             let (rect, _) = ui.allocate_exact_size(
-                                Vec2::new(180.0, 10.0),
+                                Vec2::new(220.0, 12.0),
                                 egui::Sense::hover(),
                             );
-                            ui.painter().rect_filled(
-                                rect,
-                                3.0,
-                                Color32::from_rgb(50, 52, 64),
-                            );
+                            ui.painter()
+                                .rect_filled(rect, 3.0, Color32::from_rgb(50, 52, 64));
                             let mut filled = rect;
                             filled.set_width(rect.width() * frac);
                             ui.painter()
@@ -5880,6 +8551,7 @@ impl AnimeDownloaderApp {
                                     .color(Color32::from_rgb(200, 200, 210)),
                             );
                         });
+                        ui.add_space(2.0);
                     }
                 }
             });
@@ -6215,12 +8887,6 @@ impl AnimeDownloaderApp {
             {
                 filters_changed = true;
             }
-            if ui
-                .checkbox(&mut self.hide_nsfw, "Cacher NSFW")
-                .changed()
-            {
-                filters_changed = true;
-            }
 
             ui.add_space(8.0);
 
@@ -6283,20 +8949,37 @@ impl AnimeDownloaderApp {
                 ui.add_space(4.0);
             }
 
+            ui.add(
+                egui::TextEdit::singleline(&mut self.theme_search)
+                    .id(egui::Id::new("theme_search_field"))
+                    .hint_text("Filtrer les thèmes…")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(4.0);
+
             egui::ScrollArea::vertical()
                 .max_height(180.0)
                 .auto_shrink([false, true])
                 .id_salt("themes_picker_scroll")
                 .show(ui, |ui| {
+                    let theme_q = self.theme_search.trim().to_lowercase();
                     let themes: Vec<String> = self
                         .all_themes_cache
                         .iter()
                         .filter(|t| !self.selected_themes.contains(*t))
+                        .filter(|t| theme_q.is_empty() || t.to_lowercase().contains(&theme_q))
                         .cloned()
                         .collect();
                     if themes.is_empty() && self.selected_themes.is_empty() {
                         ui.label(
                             RichText::new("Synchronise pour charger les thèmes")
+                                .size(10.0)
+                                .color(Color32::from_rgb(120, 120, 130))
+                                .italics(),
+                        );
+                    } else if themes.is_empty() {
+                        ui.label(
+                            RichText::new("Aucun thème ne correspond")
                                 .size(10.0)
                                 .color(Color32::from_rgb(120, 120, 130))
                                 .italics(),
@@ -6408,7 +9091,6 @@ impl AnimeDownloaderApp {
             {
                 self.min_user_rating = 0.0;
                 self.only_downloaded = false;
-                self.hide_nsfw = false;
                 self.selected_themes.clear();
                 self.theme_filter_mode = ThemeFilterMode::Any;
                 self.selected_statuses.clear();
@@ -6446,31 +9128,33 @@ impl AnimeDownloaderApp {
             self.sync_from_api(ctx.clone());
         }
 
-        ui.add_space(6.0);
-        let us_label = if syncing {
-            "Sync en cours…"
-        } else {
-            "Sync uniquestream"
-        };
-        let us_btn = egui::Button::new(
-            RichText::new(us_label)
-                .size(13.0)
-                .color(Color32::WHITE),
-        )
-        .fill(if syncing {
-            Color32::from_rgb(100, 100, 110)
-        } else {
-            Color32::from_rgb(139, 233, 253)
-        })
-        .corner_radius(6.0);
-        if ui
-            .add_enabled_ui(!syncing, |ui| {
-                ui.add_sized([ui.available_width(), 28.0], us_btn)
+        if self.settings.uniquestream_enabled {
+            ui.add_space(6.0);
+            let us_label = if syncing {
+                "Sync en cours…"
+            } else {
+                "Sync uniquestream"
+            };
+            let us_btn = egui::Button::new(
+                RichText::new(us_label)
+                    .size(13.0)
+                    .color(Color32::WHITE),
+            )
+            .fill(if syncing {
+                Color32::from_rgb(100, 100, 110)
+            } else {
+                Color32::from_rgb(139, 233, 253)
             })
-            .inner
-            .clicked()
-        {
-            self.sync_uniquestream(ctx.clone());
+            .corner_radius(6.0);
+            if ui
+                .add_enabled_ui(!syncing, |ui| {
+                    ui.add_sized([ui.available_width(), 28.0], us_btn)
+                })
+                .inner
+                .clicked()
+            {
+                self.sync_uniquestream(ctx.clone());
+            }
         }
 
         ui.add_space(6.0);
@@ -6498,6 +9182,60 @@ impl AnimeDownloaderApp {
             .clicked()
         {
             self.sync_voiranime(ctx.clone());
+        }
+
+        ui.add_space(4.0);
+        let refresh_label = if syncing {
+            "Sync en cours…"
+        } else {
+            "Rafraîchir voiranime (rapide)"
+        };
+        let refresh_btn = egui::Button::new(
+            RichText::new(refresh_label).size(12.0).color(Color32::BLACK),
+        )
+        .fill(if syncing {
+            Color32::from_rgb(100, 100, 110)
+        } else {
+            Color32::from_rgb(241, 250, 140)
+        })
+        .corner_radius(6.0);
+        if ui
+            .add_enabled_ui(!syncing, |ui| {
+                ui.add_sized([ui.available_width(), 26.0], refresh_btn)
+            })
+            .inner
+            .on_hover_text(
+                "Ne re-télécharge que les animes nouveaux ou mis à jour (diff via sitemap).",
+            )
+            .clicked()
+        {
+            self.refresh_voiranime(ctx.clone());
+        }
+
+        ui.add_space(6.0);
+        let as_label = if syncing {
+            "Sync en cours…"
+        } else {
+            "Sync anime-sama"
+        };
+        let as_btn = egui::Button::new(
+            RichText::new(as_label).size(13.0).color(Color32::BLACK),
+        )
+        .fill(if syncing {
+            Color32::from_rgb(100, 100, 110)
+        } else {
+            Color32::from_rgb(241, 196, 64)
+        })
+        .corner_radius(6.0);
+        if ui
+            .add_enabled_ui(!syncing, |ui| {
+                ui.add_sized([ui.available_width(), 28.0], as_btn)
+            })
+            .inner
+            .on_hover_text("Sitemap incrémental : 1er sync complet, ensuite seulement le neuf/modifié.")
+            .clicked()
+        {
+            self.sync_animesama(ctx.clone());
         }
 
         ui.add_space(6.0);
@@ -6591,6 +9329,9 @@ impl AnimeDownloaderApp {
             || self.settings_pending.skip_existing != self.settings.skip_existing
             || self.settings_pending.theme_dark != self.settings.theme_dark
             || self.settings_pending.notifications_enabled != self.settings.notifications_enabled
+            || self.settings_pending.hide_nsfw != self.settings.hide_nsfw
+            || (self.settings_pending.ui_scale - self.settings.ui_scale).abs() > 0.001
+            || self.settings_pending.uniquestream_enabled != self.settings.uniquestream_enabled
             || self.settings_pending.sidecar_warmup != self.settings.sidecar_warmup
             || self.settings_pending.consumet_base_url != self.settings.consumet_base_url
             || self.settings_pending.consumet_provider != self.settings.consumet_provider
@@ -6621,19 +9362,32 @@ impl AnimeDownloaderApp {
                     .max_height(ui.available_height() - 60.0)
                     .show(ui, |ui| {
                         section_header(ui, "Téléchargements");
+                        let cpu = detected_cpu_count();
                         ui.label(
-                            RichText::new("Nombre maximum de .mp4 téléchargés en parallèle.")
-                                .size(11.0)
-                                .color(Color32::from_rgb(150, 150, 160)),
+                            RichText::new(format!(
+                                "Nombre maximum de .mp4 téléchargés en parallèle. CPU détecté : {} cœurs.",
+                                cpu
+                            ))
+                            .size(11.0)
+                            .color(Color32::from_rgb(150, 150, 160)),
                         );
-                        ui.add(
-                            egui::Slider::new(
-                                &mut self.settings_pending.max_concurrent_downloads,
-                                1..=16,
-                            )
-                            .clamping(egui::SliderClamping::Always)
-                            .text("simultanés"),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.settings_pending.max_concurrent_downloads,
+                                    1..=32,
+                                )
+                                .clamping(egui::SliderClamping::Always)
+                                .text("simultanés"),
+                            );
+                            if ui
+                                .button(RichText::new(format!("Auto ({})", default_max_concurrent_downloads())).size(11.0))
+                                .clicked()
+                            {
+                                self.settings_pending.max_concurrent_downloads =
+                                    default_max_concurrent_downloads();
+                            }
+                        });
 
                         ui.add_space(14.0);
                         section_header(ui, "Extraction");
@@ -6841,7 +9595,30 @@ impl AnimeDownloaderApp {
                         section_header(ui, "Notifications");
                         ui.checkbox(
                             &mut self.settings_pending.notifications_enabled,
-                            "Notifications système à la fin d'un téléchargement",
+                            "Afficher les toasts in-app (erreur, bascule, fin de téléchargement)",
+                        );
+
+                        ui.add_space(14.0);
+                        section_header(ui, "Catalogue");
+                        ui.checkbox(
+                            &mut self.settings_pending.hide_nsfw,
+                            "Cacher les animes NSFW",
+                        );
+                        ui.checkbox(
+                            &mut self.settings_pending.uniquestream_enabled,
+                            "Activer uniquestream (sinon masqué du catalogue)",
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Taille de l'interface (accessibilité)")
+                                .size(11.0)
+                                .color(Color32::from_rgb(150, 150, 160)),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.settings_pending.ui_scale, 0.8..=1.8)
+                                .step_by(0.05)
+                                .clamping(egui::SliderClamping::Always)
+                                .text("× zoom"),
                         );
 
                         ui.add_space(14.0);
@@ -7097,7 +9874,12 @@ impl AnimeDownloaderApp {
                 let guard = db.lock().await;
                 pending_save.save(&guard);
             });
+            let refilter = pending.hide_nsfw != self.settings.hide_nsfw
+                || pending.uniquestream_enabled != self.settings.uniquestream_enabled;
             self.settings = pending;
+            if refilter {
+                self.filter_animes();
+            }
         }
         if should_cancel {
             self.settings_pending = self.settings.clone();
@@ -7306,6 +10088,154 @@ fn walk_dir(base: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+async fn try_source_attempt(
+    manager: &Arc<DownloadManager>,
+    fetcher: &Arc<UrlFetcher>,
+    task_id: &str,
+    attempt: &SourceAttempt,
+    lang: &'static str,
+) -> Result<(), String> {
+    match attempt {
+        SourceAttempt::Franime {
+            anime_id,
+            season_idx,
+            ep_idx,
+            lecteurs,
+            host_names,
+        } => {
+            let mut last = "aucun lecteur".to_string();
+            for lecteur in lecteurs {
+                let host_name = host_names
+                    .get(lecteur)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{}", lecteur));
+                manager
+                    .set_task_host(task_id, Some(format!("franime(alt):{}", host_name)))
+                    .await;
+                let iframe_url = match fetcher
+                    .fetch_video_url(
+                        *anime_id,
+                        *season_idx as u64,
+                        *ep_idx as u64,
+                        lang,
+                        *lecteur,
+                    )
+                    .await
+                {
+                    Ok(u) => u,
+                    Err(e) => {
+                        last = format!("{}: API {}", host_name, e);
+                        continue;
+                    }
+                };
+                match manager
+                    .extract_and_download(task_id.to_string(), iframe_url)
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last = format!("{}: {}", host_name, e),
+                }
+            }
+            Err(last)
+        }
+        SourceAttempt::Voiranime {
+            ep_url,
+            sources,
+            order,
+        } => {
+            let referer = "https://voir-anime.to/".to_string();
+            if !sources.is_empty() {
+                let mut last = "aucune source".to_string();
+                for i in order {
+                    let Some(src) = sources.get(*i as usize) else {
+                        continue;
+                    };
+                    manager
+                        .set_task_host(task_id, Some(format!("voiranime(alt):{}", src.host)))
+                        .await;
+                    match manager
+                        .extract_and_download_embed(
+                            task_id.to_string(),
+                            src.iframe.clone(),
+                            referer.clone(),
+                        )
+                        .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(e) => last = format!("{}: {}", src.host, e),
+                    }
+                }
+                return Err(last);
+            }
+            if let Some(url) = ep_url {
+                manager
+                    .set_task_host(task_id, Some("voiranime(alt)".to_string()))
+                    .await;
+                match voiranime::VaClient::new() {
+                    Ok(c) => match c.episode_iframe(url).await {
+                        Ok(iframe) => manager
+                            .extract_and_download_embed(task_id.to_string(), iframe, referer)
+                            .await
+                            .map_err(|e| format!("DL: {}", e)),
+                        Err(e) => Err(format!("iframe: {}", e)),
+                    },
+                    Err(e) => Err(format!("client: {}", e)),
+                }
+            } else {
+                Err("pas de source voiranime".to_string())
+            }
+        }
+        SourceAttempt::Uniquestream {
+            ep_cid,
+            audio_locales,
+            is_movie,
+        } => {
+            let prefer_dub = lang == "vf";
+            let locale = uniquestream::pick_audio_locale(&Some(audio_locales.clone()), prefer_dub);
+            manager
+                .set_task_host(task_id, Some(format!("uniquestream(alt):{}", locale)))
+                .await;
+            let client = uniquestream::UsClient::new().map_err(|e| format!("client: {}", e))?;
+            let media = if *is_movie {
+                client.movie_media_hls(ep_cid, &locale).await
+            } else {
+                client.episode_media_hls(ep_cid, &locale).await
+            };
+            match media {
+                Ok(url) => manager
+                    .download_direct(task_id.to_string(), url)
+                    .await
+                    .map_err(|e| format!("DL: {}", e)),
+                Err(e) => Err(format!("media: {}", e)),
+            }
+        }
+        SourceAttempt::Animesama { sources, order } => {
+            let referer = "https://anime-sama.to/".to_string();
+            let mut last = "aucune source".to_string();
+            for i in order {
+                let Some(src) = sources.get(*i as usize) else {
+                    continue;
+                };
+                manager
+                    .set_task_host(task_id, Some(format!("anime-sama(alt):{}", src.host)))
+                    .await;
+                match manager
+                    .extract_and_download_embed(
+                        task_id.to_string(),
+                        src.iframe.clone(),
+                        referer.clone(),
+                    )
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last = format!("{}: {}", src.host, e),
+                }
+            }
+            Err(last)
+        }
+    }
 }
 
 async fn try_anikuro(
@@ -7542,6 +10472,18 @@ async fn run_va_sync(db: Arc<AsyncMutex<Database>>) -> SyncOutcome {
         ),
     );
 
+    let (deep_done, total_pending) = va_deep_enrich(db.clone(), img_client.clone()).await;
+
+    SyncOutcome::Success {
+        saved: saved + deep_done,
+        total: saved + total_pending,
+    }
+}
+
+async fn va_deep_enrich(
+    db: Arc<AsyncMutex<Database>>,
+    img_client: reqwest::Client,
+) -> (usize, usize) {
     let pending = {
         let guard = db.lock().await;
         guard.load_va_animes_pending_deep().unwrap_or_default()
@@ -7653,10 +10595,274 @@ async fn run_va_sync(db: Arc<AsyncMutex<Database>>) -> SyncOutcome {
             deep_done, deep_err
         ),
     );
+    (deep_done, total_pending)
+}
+
+async fn run_va_refresh(db: Arc<AsyncMutex<Database>>) -> SyncOutcome {
+    let client = match voiranime::VaClient::new() {
+        Ok(c) => c,
+        Err(e) => return SyncOutcome::Failure(format!("client voiranime: {}", e)),
+    };
+    let img_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    applog::log_event(
+        applog::LogSource::App,
+        applog::LogLevel::Info,
+        "voiranime refresh: fetch sitemap_index".to_string(),
+    );
+    let index = match client.fetch_sitemap_index().await {
+        Ok(i) => i,
+        Err(e) => return SyncOutcome::Failure(format!("sitemap index: {}", e)),
+    };
+
+    let mut state: HashMap<String, String> = {
+        let guard = db.lock().await;
+        guard
+            .get_setting("va_subsitemap_lastmods")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    };
+    let stored_lastmods = {
+        let guard = db.lock().await;
+        guard.get_va_anime_lastmods().unwrap_or_default()
+    };
+
+    let mut new_or_changed = 0usize;
+    let mut files_scanned = 0usize;
+    for (loc, file_lastmod) in &index {
+        if !loc.contains("wp-manga-sitemap") {
+            continue;
+        }
+        if state.get(loc).map(|s| s == file_lastmod).unwrap_or(false) {
+            continue;
+        }
+        let entries = match client.fetch_series_sitemap(loc).await {
+            Ok(e) => e,
+            Err(e) => {
+                applog::log_event(
+                    applog::LogSource::App,
+                    applog::LogLevel::Warn,
+                    format!("voiranime sitemap {} KO: {}", loc, e),
+                );
+                continue;
+            }
+        };
+        files_scanned += 1;
+        {
+            let guard = db.lock().await;
+            for (slug, alm) in &entries {
+                let url = format!("{}/anime/{}/", voiranime::BASE, slug);
+                match stored_lastmods.get(slug) {
+                    None => {
+                        let _ = guard.upsert_va_slug(slug, &url, alm);
+                        new_or_changed += 1;
+                    }
+                    Some((stored, deep_done)) => {
+                        let stored = stored.as_deref().unwrap_or("");
+                        if stored.is_empty() {
+                            if *deep_done {
+                                let _ = guard.set_va_anime_lastmod(slug, alm);
+                            } else {
+                                let _ = guard.upsert_va_slug(slug, &url, alm);
+                                new_or_changed += 1;
+                            }
+                        } else if alm.as_str() > stored {
+                            let _ = guard.upsert_va_slug(slug, &url, alm);
+                            new_or_changed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        state.insert(loc.clone(), file_lastmod.clone());
+    }
+
+    {
+        let guard = db.lock().await;
+        if let Ok(json) = serde_json::to_string(&state) {
+            let _ = guard.set_setting("va_subsitemap_lastmods", &json);
+        }
+    }
+
+    applog::log_event(
+        applog::LogSource::App,
+        applog::LogLevel::Info,
+        format!(
+            "voiranime refresh: {} sous-sitemaps scannés, {} animes nouveaux/modifiés à enrichir",
+            files_scanned, new_or_changed
+        ),
+    );
+
+    let (deep_done, _total) = va_deep_enrich(db.clone(), img_client).await;
 
     SyncOutcome::Success {
-        saved: saved + deep_done,
-        total: saved + total_pending,
+        saved: deep_done,
+        total: new_or_changed,
+    }
+}
+
+async fn as_deep_enrich(
+    db: Arc<AsyncMutex<Database>>,
+    img_client: reqwest::Client,
+) -> (usize, usize) {
+    let pending = {
+        let guard = db.lock().await;
+        guard.load_as_animes_pending_deep().unwrap_or_default()
+    };
+    let total_pending = pending.len();
+    applog::log_event(
+        applog::LogSource::App,
+        applog::LogLevel::Info,
+        format!("anime-sama deep — {} animes à enrichir", total_pending),
+    );
+
+    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let progress_err = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(3));
+    use futures::StreamExt;
+    let tasks_stream = futures::stream::iter(pending.into_iter().map(|row| {
+        let db = db.clone();
+        let sem = semaphore.clone();
+        let progress = progress.clone();
+        let progress_err = progress_err.clone();
+        let img_client = img_client.clone();
+        async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let client = match animesama::AsClient::new() {
+                Ok(c) => c,
+                Err(_) => {
+                    progress_err.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            };
+            let cached = match client.anime_detail(&row.slug).await {
+                Ok(d) => d,
+                Err(e) => {
+                    applog::log_event(
+                        applog::LogSource::App,
+                        applog::LogLevel::Warn,
+                        format!("anime-sama detail '{}' KO: {}", row.slug, e),
+                    );
+                    progress_err.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            };
+            if let Some(img) = cached.image.clone() {
+                let _ = cache_images_batch(
+                    &db,
+                    &img_client,
+                    vec![(img, Some("https://anime-sama.to/".to_string()))],
+                )
+                .await;
+            }
+            let json = match serde_json::to_string(&cached) {
+                Ok(s) => s,
+                Err(_) => {
+                    progress_err.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            };
+            {
+                let guard = db.lock().await;
+                let _ = guard.save_as_episodes(&row.slug, &json);
+                let _ = guard.mark_as_deep_done(&row.slug);
+            }
+            let done = progress.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if done % 25 == 0 || done == total_pending {
+                applog::log_event(
+                    applog::LogSource::App,
+                    applog::LogLevel::Info,
+                    format!(
+                        "anime-sama deep progress {}/{} (err: {})",
+                        done,
+                        total_pending,
+                        progress_err.load(std::sync::atomic::Ordering::SeqCst)
+                    ),
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    }))
+    .buffer_unordered(3);
+    let _: Vec<()> = tasks_stream.collect().await;
+
+    let deep_done = progress.load(std::sync::atomic::Ordering::SeqCst);
+    (deep_done, total_pending)
+}
+
+async fn run_as_sync(db: Arc<AsyncMutex<Database>>) -> SyncOutcome {
+    let client = match animesama::AsClient::new() {
+        Ok(c) => c,
+        Err(e) => return SyncOutcome::Failure(format!("client anime-sama: {}", e)),
+    };
+    let img_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    applog::log_event(
+        applog::LogSource::App,
+        applog::LogLevel::Info,
+        "anime-sama sync: fetch sitemap".to_string(),
+    );
+    let index = match client.fetch_sitemap().await {
+        Ok(i) => i,
+        Err(e) => return SyncOutcome::Failure(format!("sitemap: {}", e)),
+    };
+
+    let stored = {
+        let guard = db.lock().await;
+        guard.get_as_anime_lastmods().unwrap_or_default()
+    };
+
+    let mut new_or_changed = 0usize;
+    {
+        let guard = db.lock().await;
+        for (slug, lm) in &index {
+            let url = format!("{}/catalogue/{}/", animesama::BASE, slug);
+            match stored.get(slug) {
+                None => {
+                    let _ = guard.upsert_as_slug(slug, &url, lm);
+                    new_or_changed += 1;
+                }
+                Some((prev, deep_done)) => {
+                    let prev = prev.as_deref().unwrap_or("");
+                    if prev.is_empty() {
+                        if *deep_done {
+                            let _ = guard.set_as_anime_lastmod(slug, lm);
+                        } else {
+                            let _ = guard.upsert_as_slug(slug, &url, lm);
+                            new_or_changed += 1;
+                        }
+                    } else if lm.as_str() > prev {
+                        let _ = guard.upsert_as_slug(slug, &url, lm);
+                        new_or_changed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    applog::log_event(
+        applog::LogSource::App,
+        applog::LogLevel::Info,
+        format!(
+            "anime-sama sync: {} animes nouveaux/modifiés à enrichir",
+            new_or_changed
+        ),
+    );
+
+    let (deep_done, _total) = as_deep_enrich(db.clone(), img_client).await;
+    SyncOutcome::Success {
+        saved: deep_done,
+        total: new_or_changed,
     }
 }
 
@@ -7680,13 +10886,8 @@ fn apply_us_cached_to_anime(
         .unwrap()
         .insert(anime_id_bits, cached.audio_locales.clone());
 
-    let has_dub = cached
-        .audio_locales
-        .iter()
-        .any(|l| l != "ja-JP" && !l.is_empty());
-    display.has_vo = cached.audio_locales.iter().any(|l| l == "ja-JP")
-        || cached.audio_locales.is_empty();
-    display.has_vf = has_dub;
+    display.has_vo = true;
+    display.has_vf = false;
 
     let mut saisons: Vec<crate::animes_api::Saison> = Vec::new();
     let mut id_map = us_episode_ids.lock().unwrap();
@@ -7726,6 +10927,67 @@ fn apply_us_cached_to_anime(
     }
     display.anime.saisons = saisons;
     display.us_loaded_episodes = true;
+}
+
+fn apply_as_cached_to_anime(
+    display: &mut AnimeDisplay,
+    cached: &animesama::AsCachedEpisodes,
+    as_episode_sources: &Arc<
+        StdMutex<HashMap<(u64, usize, usize), (Vec<animesama::AsSource>, Vec<animesama::AsSource>)>>,
+    >,
+) {
+    let id_bits = display.anime.id.to_bits();
+    let mut src_map = as_episode_sources.lock().unwrap();
+    src_map.retain(|(a, _, _), _| *a != id_bits);
+
+    if !cached.description.is_empty() && display.anime.description.is_empty() {
+        display.anime.description = cached.description.clone();
+    }
+    if !cached.title.is_empty() && display.anime.title.is_empty() {
+        display.anime.title = cached.title.clone();
+    }
+    if let Some(img) = cached.image.clone() {
+        if display.anime.affiche.is_empty() {
+            display.anime.affiche = img.clone();
+        }
+        display.anime.affiche_small = Some(img);
+    }
+    if !cached.genres.is_empty() && display.anime.themes.is_empty() {
+        display.anime.themes = cached.genres.clone();
+    }
+
+    let mut has_vo = false;
+    let mut has_vf = false;
+    let mut saisons: Vec<crate::animes_api::Saison> = Vec::new();
+    for (s_idx, s) in cached.seasons.iter().enumerate() {
+        let mut episodes: Vec<crate::animes_api::Episode> = Vec::new();
+        for (e_idx, e) in s.episodes.iter().enumerate() {
+            let mut ep = crate::animes_api::Episode::default();
+            ep.title = if e.title.is_empty() {
+                format!("Épisode {}", e_idx + 1)
+            } else {
+                e.title.clone()
+            };
+            if !e.vo.is_empty() {
+                has_vo = true;
+                ep.lang.vo.lecteurs = e.vo.iter().map(|s| s.host.clone()).collect();
+            }
+            if !e.vf.is_empty() {
+                has_vf = true;
+                ep.lang.vf.lecteurs = e.vf.iter().map(|s| s.host.clone()).collect();
+            }
+            src_map.insert((id_bits, s_idx, e_idx), (e.vo.clone(), e.vf.clone()));
+            episodes.push(ep);
+        }
+        let mut saison = crate::animes_api::Saison::default();
+        saison.title = s.title.clone();
+        saison.episodes = episodes;
+        saisons.push(saison);
+    }
+    display.has_vo = has_vo;
+    display.has_vf = has_vf;
+    display.anime.saisons = saisons;
+    display.as_loaded_episodes = true;
 }
 
 fn host_from_url(url: &str) -> String {

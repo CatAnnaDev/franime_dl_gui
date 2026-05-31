@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+
 concurrency:
   group: release
   cancel-in-progress: false
@@ -22,47 +23,34 @@ jobs:
       tag: ${{ steps.compute.outputs.tag }}
       version: ${{ steps.compute.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Toolchain stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Détermine le prochain numéro
+      - name: Determine le prochain numero
         id: compute
         shell: bash
         run: |
           set -euo pipefail
           git fetch --tags --force --quiet || true
-
-          # Version déclarée dans Cargo.toml (sans dépendance à jq sur ce point).
-          cargo_ver=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[0].version')
-
-          # Dernier tag publié de la forme vX.Y.Z, le plus élevé.
+          cargo_ver=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           latest=$(git tag -l 'v*.*.*' | sed 's/^v//' | sort -V | tail -n1 || true)
-
           if [[ -z "${latest}" ]]; then
-            # Aucune release encore : on part de la version de Cargo.toml.
             next="${cargo_ver}"
           else
-            # On incrémente le patch du dernier tag...
             IFS='.' read -r MA MI PA <<< "${latest}"
             bumped="${MA}.${MI}.$((PA + 1))"
-            # ...mais si Cargo.toml demande plus haut, on respecte Cargo.toml.
             next=$(printf '%s\n%s\n' "${cargo_ver}" "${bumped}" | sort -V | tail -n1)
           fi
-
-          # Sécurité : si ce tag existe déjà, on monte le patch jusqu'à un libre.
           while git rev-parse "v${next}" >/dev/null 2>&1; do
             IFS='.' read -r MA MI PA <<< "${next}"
             next="${MA}.${MI}.$((PA + 1))"
           done
-
-          echo "version=${next}"     >> "$GITHUB_OUTPUT"
-          echo "tag=v${next}"        >> "$GITHUB_OUTPUT"
-          echo "Prochaine version : v${next}"
+          echo "version=${next}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${next}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.target }}
@@ -74,19 +62,18 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            linker: gcc-aarch64-linux-gnu
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Toolchain stable (+ cible ${{ matrix.target }})
+      - name: Toolchain stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -94,13 +81,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-
-      - name: Linker de cross-compilation (Linux arm64 uniquement)
-        if: matrix.linker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.linker }}
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       - name: Build release
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -114,19 +94,13 @@ jobs:
           set -euo pipefail
           target="${{ matrix.target }}"
           bindir="target/${target}/release"
-
-          bins=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name')
-
+          bins=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name')
           if [[ -z "${bins}" ]]; then
-            echo "Aucun binaire (lib seule) — rien à empaqueter."
             echo "asset=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
           ext=""
           [[ "${target}" == *windows* ]] && ext=".exe"
-
           stage="pkg"
           mkdir -p "${stage}"
           for bin in ${bins}; do
@@ -134,10 +108,9 @@ jobs:
             if [[ -f "${src}" ]]; then
               cp "${src}" "${stage}/"
             else
-              echo "::warning::binaire attendu introuvable : ${src}"
+              echo "::warning::binaire introuvable : ${src}"
             fi
           done
-
           base="$(basename "$(git rev-parse --show-toplevel)")-${VERSION}-${target}"
           if [[ "${target}" == *windows* ]]; then
             asset="${base}.zip"
@@ -146,11 +119,9 @@ jobs:
             asset="${base}.tar.gz"
             tar -czf "${asset}" -C "${stage}" .
           fi
-
           echo "asset=${asset}" >> "$GITHUB_OUTPUT"
-          echo "Archive : ${asset}"
 
-      - name: Téléverse l'artefact
+      - name: Televerse l'artefact
         if: steps.package.outputs.asset != ''
         uses: actions/upload-artifact@v4
         with:
@@ -159,17 +130,17 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Publie la Release ${{ needs.version.outputs.tag }}
+    name: Publie la Release
     needs: [version, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Récupère toutes les archives
+      - name: Recupere toutes les archives
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Crée la Release (et pose le tag automatiquement)
+      - name: Cree la Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}

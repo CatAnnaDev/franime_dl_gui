@@ -36,7 +36,12 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --tags --force --quiet || true
-          cargo_ver=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ -f Cargo.toml ]; then
+            manifest="Cargo.toml"
+          else
+            manifest=$(find . -name Cargo.toml | grep -v '/target/' | awk -F/ '{print NF, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+          fi
+          cargo_ver=$(cargo metadata --no-deps --format-version 1 --manifest-path "$manifest" | jq -r '.packages[0].version')
           latest=$(git tag -l 'v*.*.*' | sed 's/^v//' | sort -V | tail -n1 || true)
           if [[ -z "${latest}" ]]; then
             next="${cargo_ver}"
@@ -73,6 +78,24 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Dependances systeme Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libudev-dev
+
+      - name: Localise le projet
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.toml ]; then
+            mfdir="."
+          else
+            manifest=$(find . -name Cargo.toml | grep -v '/target/' | awk -F/ '{print NF, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+            mfdir=$(dirname "$manifest")
+          fi
+          echo "MANIFEST_DIR=${mfdir}" >> "$GITHUB_ENV"
+
       - name: Toolchain stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -81,9 +104,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          workspaces: ${{ env.MANIFEST_DIR }}
 
       - name: Build release
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} --manifest-path "${{ env.MANIFEST_DIR }}/Cargo.toml"
 
       - name: Empaquette les binaires
         id: package
@@ -93,8 +117,9 @@ jobs:
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
-          bindir="target/${target}/release"
-          bins=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name')
+          mfdir="${{ env.MANIFEST_DIR }}"
+          bindir="${mfdir}/target/${target}/release"
+          bins=$(cargo metadata --no-deps --format-version 1 --manifest-path "${mfdir}/Cargo.toml" | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name')
           if [[ -z "${bins}" ]]; then
             echo "asset=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -102,6 +127,7 @@ jobs:
           ext=""
           [[ "${target}" == *windows* ]] && ext=".exe"
           stage="pkg"
+          rm -rf "${stage}"
           mkdir -p "${stage}"
           for bin in ${bins}; do
             src="${bindir}/${bin}${ext}"
